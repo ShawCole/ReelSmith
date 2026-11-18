@@ -22,7 +22,8 @@
 <p align="center">
   <a href="https://github.com/ShawCole/ReelSmith">Source</a> ·
   <a href="https://github.com/ShawCole/ReelSmith/issues">Issues</a> ·
-  <a href="docs/style-pipeline/SPEC.md">Style pipeline</a>
+  <a href="docs/style-pipeline/SPEC.md">Style pipeline</a> ·
+  <a href="docs/portal/DESIGN.md">Review portal</a>
 </p>
 
 <p align="center">
@@ -250,6 +251,7 @@ The control protocol is documented in [docs/control-protocol.md](docs/control-pr
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [docs/contributing.md](docs/contributing.md) | Setup, quality gates, commit conventions, how to add commands, effects, codecs, panels and assets |
 | [AGENTS.md](AGENTS.md) | The rules every contributor must follow: assets, clean room, licences |
 | [docs/architecture.md](docs/architecture.md) | Layers, data model, time base, command system, render and export pipeline |
+| [docs/portal/DESIGN.md](docs/portal/DESIGN.md) | Review portal: client uploads, the two timeline modes, the append-only edit log |
 | [docs/testing.md](docs/testing.md) | Unit, property and ffmpeg-oracle tests, accuracy criteria, benchmarks |
 | [docs/agents.md](docs/agents.md) | Driving ReelSmith over MCP and the control channel; how agents develop it |
 | [docs/control-protocol.md](docs/control-protocol.md) | Control-channel and MCP reference |
@@ -384,7 +386,7 @@ emerge --ask media-video/reelsmith-bin
 
 ReelSmith is a modified version of [FilmCraft](https://github.com/storytold/filmcraft), an open-source non-linear video editor. This tree keeps FilmCraft's Apache-2.0 and MIT license texts and the copyright notices in source files. See [NOTICE](NOTICE).
 
-The style pipeline (learn an editing style from finished work, suggest changes, apply it to raw footage) is specified in [docs/style-pipeline/SPEC.md](docs/style-pipeline/SPEC.md). The ad-edit runbook is [docs/style-pipeline/AD_RUNBOOK.md](docs/style-pipeline/AD_RUNBOOK.md).
+The style pipeline (learn an editing style from finished work, suggest changes, apply it to raw footage) is specified in [docs/style-pipeline/SPEC.md](docs/style-pipeline/SPEC.md). The ad-edit runbook is [docs/style-pipeline/AD_RUNBOOK.md](docs/style-pipeline/AD_RUNBOOK.md). The review portal, where clients upload footage and mark a cut, is specified in [docs/portal/DESIGN.md](docs/portal/DESIGN.md).
 
 ## License and credits
 
