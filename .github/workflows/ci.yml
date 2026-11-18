@@ -25,4 +25,4 @@ jobs:
             libxcb1-dev libxcursor-dev libxrandr-dev libxi-dev libfontconfig1-dev \
             libfreetype-dev libasound2-dev libvulkan1 cmake clang
       - name: Build the desktop app and CLI
-        run: cargo build -p reelsmith -p reelsmith-cli
+        run: cargo build -p reelsmith -p reelsmith-cli -p reelsmith-portal
