@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <?ifndef HasCraftFontLicences ?>
+  <?define HasCraftFontLicences=0 ?>
+  <?endif?>
+  <Package Name="ReelSmith" Manufacturer="BizyPro" Version="$(var.Version)" UpgradeCode="7F3A9C2E-6D14-4B8A-9E25-1C0B8D4F6A31" Scope="perUserOrMachine" Compressed="yes" Language="1033">
+    <SummaryInformation Description="ReelSmith video editor" Manufacturer="BizyPro" />
+    <?include $(sys.SOURCEFILEDIR)install-policy.wxi?>
+    <!-- Same-version upgrades let successive pre-releases of one X.Y.Z replace each other
+         (MSI versions are numeric, so 1.2.3-rc.1 and 1.2.3-rc.2 are both 1.2.3). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of ReelSmith is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="ReelsmithIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="ReelsmithIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ShawCole/ReelSmith" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/ShawCole/ReelSmith" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/ShawCole/ReelSmith" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="CraftSuiteFolder" Name="ReelSmith">
+        <Directory Id="INSTALLFOLDER" Name="ReelSmith" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Feature Id="Main" Title="ReelSmith" Level="1">
+      <?if $(var.HasCraftFontLicences) = 1 ?>
+      <ComponentGroupRef Id="CraftFontLicences" />
+      <?endif?>
+      <ComponentGroupRef Id="ReelsmithFiles" />
+    </Feature>
+  <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2" Condition="NOT Installed" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="NOT Installed" />
+    </UI>
+  </Package>
+
+  <Fragment>
+    <?if $(var.HasCraftFontLicences) = 1 ?>
+    <ComponentGroup Id="CraftFontLicences" Directory="INSTALLFOLDER">
+      <Files Include="$(var.DocsDir)\**" />
+    </ComponentGroup>
+    <?endif?>
+    <ComponentGroup Id="ReelsmithFiles" Directory="INSTALLFOLDER">
+      <Component Id="ReelsmithApp" Guid="15933017-925B-4963-8992-52000EB26AAA">
+        <File Id="ReelsmithNotice" Source="$(var.BinDir)\NOTICE" KeyPath="no" />
+        <File Id="ReelsmithExe" Source="$(var.BinDir)\reelsmith.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="ReelSmith" Description="ReelSmith video editor" WorkingDirectory="INSTALLFOLDER" Advertise="yes" Icon="ReelsmithIcon.ico" IconIndex="0" />
+        </File>
+
+        <RegistryValue Root="HKMU" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\reelsmith.exe" Value="[#ReelsmithExe]" Type="string" />
+      <RegistryValue Root="HKMU" Key="Software\ReelSmith" Name="InstallDir" Value="[INSTALLFOLDER]" Type="string" />
+      </Component>
+
+      <Component Id="ReelsmithCli">
+        <File Id="ReelsmithCliExe" Source="$(var.BinDir)\reelsmith-cli.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

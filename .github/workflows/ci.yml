@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcb1-dev libxcursor-dev libxrandr-dev libxi-dev libfontconfig1-dev \
+            libfreetype-dev libasound2-dev libvulkan1 cmake clang
+      - name: Build the desktop app and CLI
+        run: cargo build -p reelsmith -p reelsmith-cli

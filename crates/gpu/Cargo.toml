@@ -1,0 +1,32 @@
+[package]
+name = "reelsmith-gpu"
+description = "wgpu compositor: YUV/RGB layer sampling, linear-light premultiplied compositing in WGSL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reelsmith-color = { workspace = true }
+reelsmith-frame = { workspace = true }
+reelsmith-geom = { workspace = true }
+reelsmith-project = { workspace = true }
+reelsmith-render = { workspace = true }
+reelsmith-time = { workspace = true }
+wgpu = { version = "30", default-features = false, features = ["wgsl"] }
+log = { workspace = true }
+pollster = "1"
+tempfile = "3"
+rayon = { workspace = true }
+
+[dev-dependencies]
+pollster = "1"
+tempfile = "3"
+reelsmith-export = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+wgpu = { version = "30", features = ["wgsl", "metal", "vulkan", "dx12", "gles"] }
+reelsmith-media = { workspace = true }
+reelsmith-time = { workspace = true }

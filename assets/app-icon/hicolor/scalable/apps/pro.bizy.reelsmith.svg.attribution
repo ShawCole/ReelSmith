@@ -1,0 +1,8 @@
+asset:        pro.bizy.reelsmith.svg
+title:        ReelSmith app icon, Linux hicolor theme scalable
+author:       Brandon Thomas (FilmCraft), for the FilmCraft project
+source:       original work (drawn by the owner, then vectorised)
+license:      MIT OR Apache-2.0
+license-file: assets/app-icon/LICENSE.txt
+added:        2026-10-02 by Claude (agent) for Brandon Thomas
+notes:        Copy of reelsmith-small.svg, made by packaging/icons.sh.

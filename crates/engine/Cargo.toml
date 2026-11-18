@@ -1,0 +1,56 @@
+[package]
+name = "reelsmith-engine"
+description = "ReelSmith engine façade: session, command registry, history, media pool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Speech-to-text with Whisper (candle, CPU). Off by default and in wasm builds.
+whisper = ["reelsmith-speech/whisper"]
+# Speech-model downloads over HTTPS.
+speech-download = ["reelsmith-speech/download"]
+# Natural voices for Text to Speech: Kokoro-82M on candle (CPU) and their download.
+neural-voices = ["reelsmith-tts/kokoro", "speech-download"]
+
+[dependencies]
+reelsmith-time = { workspace = true }
+reelsmith-geom = { workspace = true }
+reelsmith-color = { workspace = true }
+reelsmith-frame = { workspace = true }
+reelsmith-media = { workspace = true }
+craft-media = { workspace = true, features = ["mxf"] }
+reelsmith-codecs = { workspace = true }
+reelsmith-project = { workspace = true }
+reelsmith-edit = { workspace = true }
+reelsmith-render = { workspace = true }
+reelsmith-scopes = { workspace = true }
+reelsmith-text = { workspace = true }
+reelsmith-audio-dsp = { workspace = true }
+reelsmith-export = { workspace = true }
+reelsmith-format = { workspace = true }
+reelsmith-interchange = { workspace = true }
+reelsmith-captions = { workspace = true }
+reelsmith-speech = { workspace = true }
+reelsmith-tts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+roxmltree = { workspace = true }
+chrono = { workspace = true }
+craft-docpath = { workspace = true }
+web-time = "1"
+
+[dev-dependencies]
+reelsmith-testkit = { workspace = true }
+tempfile = "3"
+reelsmith-audio-dsp = { workspace = true, features = ["test-util"] }
+reelsmith-dng = { workspace = true, features = ["writer"] }
+reelsmith-isobmff = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
