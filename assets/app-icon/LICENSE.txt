@@ -1,0 +1,12 @@
+ReelSmith app icon (reelsmith.svg and every file derived from it in this directory:
+reelsmith-small.svg, reelsmith-1024.png, reelsmith-macos-512.png, reelsmith.icns, reelsmith.ico,
+hicolor/, and apps/reelsmith-web/web/favicon.png).
+
+Original artwork by Brandon Thomas for FilmCraft, then vectorised. No third-party material. Licensed like the rest of ReelSmith, under either of
+
+  * Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license (https://opensource.org/licenses/MIT)
+
+at your option.
+
+Regenerate the derived files with packaging/icons.sh.

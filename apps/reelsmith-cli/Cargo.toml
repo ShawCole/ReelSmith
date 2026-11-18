@@ -1,0 +1,37 @@
+[package]
+name = "reelsmith-cli"
+description = "ReelSmith headless CLI and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "reelsmith-cli"
+path = "src/main.rs"
+
+[features]
+default = []
+# Speech-to-text (Text panel ▸ Transcribe) with Whisper on the CPU, and model downloads.
+whisper = ["reelsmith-engine/whisper", "reelsmith-engine/speech-download"]
+
+[dependencies]
+reelsmith-engine = { workspace = true }
+reelsmith-export = { workspace = true }
+reelsmith-project = { workspace = true }
+reelsmith-render = { workspace = true }
+reelsmith-time = { workspace = true }
+reelsmith-gpu = { workspace = true }
+reelsmith-media = { workspace = true }
+reelsmith-codecs = { workspace = true }
+reelsmith-platform = { workspace = true }
+craft-media = { workspace = true, features = ["mpegts", "mxf", "ogg"] }
+reelsmith-automation = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+reelsmith-testkit = { workspace = true }
+tempfile = "3"

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "reelsmith": {
+      "command": "target/release/reelsmith-cli",
+      "args": ["mcp", "--bridge", "127.0.0.1:9876"]
+    },
+    "reelsmith-headless": {
+      "command": "target/release/reelsmith-cli",
+      "args": ["mcp", "--demo"]
+    }
+  }
+}

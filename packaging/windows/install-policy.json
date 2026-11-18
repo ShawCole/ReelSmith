@@ -1,0 +1,27 @@
+{
+  "id": "reelsmith",
+  "name": "ReelSmith",
+  "upgradeCode": "7F3A9C2E-6D14-4B8A-9E25-1C0B8D4F6A31",
+  "sources": [
+    "reelsmith.wxs"
+  ],
+  "icon": "assets/app-icon/reelsmith.ico",
+  "localization": [],
+  "extensions": [
+    "UI"
+  ],
+  "payloads": [
+    "NOTICE",
+    "reelsmith-cli.exe",
+    "reelsmith.exe"
+  ],
+  "registry": [
+    [
+      "-1",
+      "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\reelsmith.exe",
+      "",
+      "[#ReelsmithExe]"
+    ]
+  ],
+  "mode": "dualScope"
+}
