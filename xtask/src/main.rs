@@ -75,6 +75,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("reelsmith", 6),
     ("cli", 6),
     ("web", 6),
+    ("portal", 6),
 ];
 
 /// L0 crates that are not codecs/containers (no `bitstream`-only restriction).

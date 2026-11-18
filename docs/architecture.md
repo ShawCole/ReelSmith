@@ -22,7 +22,7 @@ Design principles:
 ## 1. Layers
 
 ```text
- L6  apps/reelsmith · apps/reelsmith-cli · apps/reelsmith-web
+ L6  apps/reelsmith · apps/reelsmith-cli · apps/reelsmith-web · apps/reelsmith-portal
  L5  ui-egui · automation · platform
  L4  engine
  L3  render · gpu · export · golden (test-only)
@@ -73,6 +73,7 @@ and `reelsmith-cli`.
 | `reelsmith` | L6 | desktop binary: eframe/wgpu window, cpal audio output, file dialogs, native macOS menu, TCP control server |
 | `reelsmith-cli` | L6 | headless CLI: `exec`, `run`, `inspect`, `describe`, `commands`, `import`, `export`, `render`, `probe`, `mcp`; `--bridge` targets the running app |
 | `reelsmith-web` | L6 | the browser app (wasm32): eframe web runner on WebGPU/WebGL2, Blob-backed services, OPFS recovery, WebAudio, WebCodecs, `window.reelsmith` API ([web.md](web.md)) |
+| `reelsmith-portal` | L6 | the review portal: per-client projects, an append-only edit log, resumable uploads, and the reviewer / editor timeline ([portal/DESIGN.md](portal/DESIGN.md)) |
 
 ### What `cargo xtask layers` enforces
 
