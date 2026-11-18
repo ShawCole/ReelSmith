@@ -389,7 +389,7 @@ The style pipeline (learn an editing style from finished work, suggest changes, 
 ## License and credits
 
 ReelSmith is licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
-Copyright 2026 Vertically Integrated Payments Solutions, LLC (DBA BizyPro) for the modifications.
+Copyright 2026 BizyPro for the modifications.
 
 ReelSmith is derived from FilmCraft and modified. FilmCraft is Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors and was dual-licensed under the MIT License or the Apache License 2.0. Both upstream license texts are in this repository ([LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT)). SPDX headers in source files are unchanged. Required notices are in [NOTICE](NOTICE).
 

@@ -1,8 +1,7 @@
 ReelSmith
-Copyright 2026 Vertically Integrated Payments Solutions, LLC (DBA BizyPro)
+Copyright 2026 BizyPro
 
-ReelSmith is derived from FilmCraft and modified by Vertically Integrated Payments Solutions, LLC
-(DBA BizyPro). The modifications are offered under the Apache License, Version 2.0 (LICENSE-APACHE).
+ReelSmith is derived from FilmCraft and modified by BizyPro. The modifications are offered under the Apache License, Version 2.0 (LICENSE-APACHE).
 Upstream FilmCraft is Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors and was
 dual-licensed under the MIT License or the Apache License, Version 2.0, at your option. Both
 upstream license texts are kept (LICENSE-MIT, LICENSE-APACHE). SPDX headers in source files are
