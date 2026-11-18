@@ -210,7 +210,8 @@ function uploadForm(data) {
   const count = el("input", { type: "number", min: "1", max: "12", value: "1" });
   const diffs = el("div");
   const brollOn = el("input", { type: "checkbox" });
-  const gallery = el("div", { class: "hidden" });
+  const brollPanel = el("div", { class: "hidden" });
+  const gallery = el("div");
   const checks = [];
   for (const item of data.broll) {
     const row = el("label", { class: "row" });
@@ -221,6 +222,7 @@ function uploadForm(data) {
   }
   if (!data.broll.length) gallery.append(el("p", { class: "note" }, "No B-roll in the library yet. Upload some below, or leave the gallery empty and the editor will pick."));
   const brollFiles = el("input", { type: "file", multiple: "true" });
+  brollPanel.append(gallery, field("B-roll files (separate from the raw footage)", brollFiles));
   const rawFiles = el("input", { type: "file", multiple: "true", required: "true" });
   const change = el("input", { type: "checkbox" });
   const width = el("input", { type: "number", min: "1", placeholder: "width" });
@@ -239,7 +241,7 @@ function uploadForm(data) {
   }
   count.addEventListener("input", refreshDiffs);
   refreshDiffs();
-  brollOn.addEventListener("change", () => gallery.classList.toggle("hidden", !brollOn.checked));
+  brollOn.addEventListener("change", () => brollPanel.classList.toggle("hidden", !brollOn.checked));
   form.append(
     name,
     field("Final type", type),
@@ -252,7 +254,7 @@ function uploadForm(data) {
   form.append(range, field("How many versions", count), diffs);
   const brollRow = el("label", { class: "row" });
   brollRow.append(brollOn, el("span", null, "Use B-roll?"));
-  form.append(brollRow, gallery, field("B-roll files (separate from the raw footage)", brollFiles));
+  form.append(brollRow, brollPanel);
   form.append(field("Raw footage", rawFiles), manual, field("Width", fallbackW), field("Height", fallbackH), field("Duration", fallbackS));
   const changeRow = el("label", { class: "row" });
   changeRow.append(change, el("span", null, "Change format"));
