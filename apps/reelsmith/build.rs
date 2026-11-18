@@ -22,7 +22,7 @@ mod windows {
         res.set_icon("../../assets/app-icon/reelsmith.ico")
             .set("ProductName", "ReelSmith")
             .set("FileDescription", "ReelSmith video editor")
-            .set("LegalCopyright", "Copyright (c) the FilmCraft contributors. Copyright 2026 Vertically Integrated Payments Solutions, LLC (DBA BizyPro). Apache-2.0.")
+            .set("LegalCopyright", "Copyright (c) the FilmCraft contributors. Copyright 2026 BizyPro. Apache-2.0.")
             .set("OriginalFilename", "reelsmith.exe")
             .set("InternalName", "reelsmith");
         if let Err(e) = res.compile() {
