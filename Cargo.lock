@@ -6091,6 +6091,7 @@ dependencies = [
  "reelsmith-media",
  "reelsmith-time",
  "reelsmith-ui-egui",
+ "serde",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
