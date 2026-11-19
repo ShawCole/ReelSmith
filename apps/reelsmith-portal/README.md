@@ -1,6 +1,6 @@
 # reelsmith-portal
 
-The review portal. A client uploads raw footage; the editor cuts it; the client reviews and edits the cut in the real ReelSmith editor (the wasm build of `apps/reelsmith-web`), not a look-alike. The plan and the HTTP contract are PLAN.md and API.md (kept by pm-reelsmith); the older design notes are in `docs/portal/DESIGN.md`.
+The review portal. A client uploads raw footage; the editor cuts it; the client reviews and edits the cut in the real ReelSmith editor (the wasm build of `apps/reelsmith-web`), not a look-alike. The design, the roles and the HTTP routes are in [`docs/portal/DESIGN.md`](../../docs/portal/DESIGN.md).
 
 ## How it works
 

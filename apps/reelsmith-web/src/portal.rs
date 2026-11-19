@@ -20,7 +20,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use crate::{WebApp, post};
 
 /// How often the page asks the portal whether the version changed.
-const POLL_MS: f64 = 1500.0;
+const POLL_MS: f64 = 1000.0;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Actor {
