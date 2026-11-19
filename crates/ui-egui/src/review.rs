@@ -142,6 +142,20 @@ impl ReelsmithApp {
         if !r.locked() {
             return !id.starts_with("window.workspace") && !matches!(id, "app.quit" | "file.closeProject" | "file.closeAllProjects");
         }
+        // tab switches, splitter drags and focus moves inside the review layout; opening any
+        // other panel is refused by `show_panel`
+        const LAYOUT: &[&str] = &[
+            "window.dockAction",
+            "window.maximizeFrame",
+            "window.maximizeFrameUnderCursor",
+            "window.nextPanel",
+            "window.prevPanel",
+            "window.toggleFullScreen",
+            "window.toggleMonitorFocus",
+        ];
+        if LAYOUT.contains(&id) {
+            return true;
+        }
         if let Some(panel) = id.strip_prefix("window.panel.") {
             return PanelKind::from_name(panel).is_some_and(|p| REVIEW_PANELS.contains(&p));
         }
