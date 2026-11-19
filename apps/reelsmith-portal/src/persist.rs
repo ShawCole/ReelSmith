@@ -1,13 +1,20 @@
-//! Portal metadata and the append-only event files. The event file is only appended to.
-//! A cursor file records which step is current. Neither file is truncated.
+//! Portal metadata (`portal.json`) and where each version's files live under the data dir:
+//!
+//! ```text
+//! projects/{project}/versions/{version}/
+//!   base.fcproj            the cut as first handed to review (written once)
+//!   head.fcproj            the server's latest replayed state (atomic write)
+//!   actions.jsonl          append-only (history.rs)
+//!   comments.json          threads (atomic write; every change is also an action)
+//!   feedback/approval.json style-pipeline Gate B mark (SPEC §5.1)
+//!   feedback/feedback.json reelsmith.portal.feedback/2
+//! ```
 
 use crate::error::Error;
-use crate::history::History;
-use crate::model::{EditEvent, MediaTick};
+use crate::model::{Approval, Comment, MediaTick, Status};
 use crate::storage::atomic_write;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,7 +39,12 @@ pub struct ProjectRecord {
     pub client_id: String,
     pub name: String,
     pub reviewer_token: String,
-    pub agent_token: String,
+    /// The full editor's link (the editing agent). PR #5 called it the agent token.
+    #[serde(alias = "agent_token")]
+    pub editor_token: String,
+    /// Watch-only link, one per project.
+    #[serde(default)]
+    pub watcher_token: String,
     pub plan: crate::brief::BriefPlan,
     pub versions: Vec<VersionRecord>,
     pub created_at: String,
@@ -41,7 +53,28 @@ pub struct ProjectRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VersionRecord {
     pub id: String,
-    pub difference: String,
+    /// What makes this version different ("Primary reel", "Short hook", …).
+    #[serde(alias = "difference")]
+    pub label: String,
+    #[serde(default)]
+    pub status: Status,
+    #[serde(default)]
+    pub approval: Option<Approval>,
+    /// The media the project names, in manifest order (`/api/v/{version}/media/{n}`).
+    #[serde(default)]
+    pub media: Vec<MediaEntry>,
+}
+
+/// One media file a version's project names.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MediaEntry {
+    /// The path inside the project (`/files/Ocean_Sunset.mp4`).
+    pub path: String,
+    /// The stored object (raw upload).
+    pub key: String,
+    /// Its reviewer proxy, once one is made.
+    #[serde(default)]
+    pub proxy_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,12 +85,6 @@ pub struct BrollRecord {
     pub width: u32,
     pub height: u32,
     pub duration: MediaTick,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CursorFile {
-    state_of: Option<u64>,
-    redo_of: Option<u64>,
 }
 
 pub fn load_saved(root: &Path) -> Result<Option<Saved>, Error> {
@@ -74,95 +101,68 @@ pub fn save_saved(root: &Path, saved: &Saved) -> Result<(), Error> {
     atomic_write(&root.join("portal.json"), &bytes)
 }
 
-pub fn load_history(root: &Path, fallback: &crate::model::Snapshot, project: &str, version: &str) -> Result<History, Error> {
-    let base = read_base(root, project, version)?.unwrap_or_else(|| fallback.clone());
-    let path = history_path(root, project, version);
-    let mut events = Vec::new();
-    if path.exists() {
-        let file = fs::File::open(&path).map_err(|_| Error::invalid("could not read history"))?;
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|_| Error::invalid("could not read history"))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: EditEvent = serde_json::from_str(&line).map_err(|_| Error::invalid(format!("history line {} is unreadable", index + 1)))?;
-            events.push(event);
-        }
-    }
-    let mut history = History::new(base.clone());
-    history.events = events;
-    if let Some(cursor) = read_cursor(root, project, version)? {
-        let known = |id: u64| history.events.iter().any(|event| event.id == id);
-        history.state_of = cursor.state_of.filter(|id| known(*id));
-        history.redo_of = cursor.redo_of.filter(|id| known(*id));
-    } else if let Some(last) = history.events.last() {
-        history.state_of = Some(last.id);
-    }
-    Ok(history)
+/// The files of one version.
+#[derive(Clone, Debug)]
+pub struct VersionFiles {
+    pub dir: PathBuf,
 }
 
-pub fn save_history(root: &Path, project: &str, version: &str, history: &History) -> Result<(), Error> {
-    let base_bytes = serde_json::to_vec(&history.base).map_err(|_| Error::invalid("could not record the base cut"))?;
-    atomic_write(&base_path(root, project, version), &base_bytes)?;
-    let path = history_path(root, project, version);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+impl VersionFiles {
+    pub fn new(root: &Path, project: &str, version: &str) -> Self {
+        Self { dir: root.join("projects").join(project).join("versions").join(version) }
     }
-    let existing = if path.exists() { count_lines(&path)? } else { 0 };
-    if existing > history.events.len() {
-        return Err(Error::conflict("refusing to shorten the edit history"));
+
+    pub fn base(&self) -> PathBuf {
+        self.dir.join("base.fcproj")
     }
-    if existing < history.events.len() {
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        for event in history.events.iter().skip(existing) {
-            let line = serde_json::to_string(event).map_err(|_| Error::invalid("could not record the edit"))?;
-            writeln!(file, "{line}")?;
+
+    pub fn head(&self) -> PathBuf {
+        self.dir.join("head.fcproj")
+    }
+
+    pub fn actions(&self) -> PathBuf {
+        self.dir.join("actions.jsonl")
+    }
+
+    pub fn comments(&self) -> PathBuf {
+        self.dir.join("comments.json")
+    }
+
+    pub fn approval(&self) -> PathBuf {
+        self.dir.join("feedback").join("approval.json")
+    }
+
+    pub fn feedback(&self) -> PathBuf {
+        self.dir.join("feedback").join("feedback.json")
+    }
+
+    /// Start a version: `base.fcproj` and `head.fcproj` from `project`, an empty log.
+    /// The base is never replaced once written.
+    pub fn create(&self, project: &[u8]) -> Result<(), Error> {
+        fs::create_dir_all(self.dir.join("feedback"))?;
+        if self.base().exists() {
+            return Err(Error::conflict("this version already has a base cut"));
         }
-        file.sync_all()?;
+        atomic_write(&self.base(), project)?;
+        atomic_write(&self.head(), project)?;
+        fs::OpenOptions::new().create(true).append(true).open(self.actions())?;
+        write_comments(&self.comments(), &[])
     }
-    let cursor = CursorFile { state_of: history.state_of, redo_of: history.redo_of };
-    let bytes = serde_json::to_vec(&cursor).map_err(|_| Error::invalid("could not record the history cursor"))?;
-    atomic_write(&cursor_path(root, project, version), &bytes)
 }
 
-fn count_lines(path: &Path) -> Result<usize, Error> {
-    let file = fs::File::open(path).map_err(|_| Error::invalid("could not read history"))?;
-    let mut count = 0usize;
-    for line in BufReader::new(file).lines() {
-        let line = line.map_err(|_| Error::invalid("could not read history"))?;
-        if !line.trim().is_empty() {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
-}
-
-fn read_cursor(root: &Path, project: &str, version: &str) -> Result<Option<CursorFile>, Error> {
-    let path = cursor_path(root, project, version);
+pub fn read_comments(path: &Path) -> Result<Vec<Comment>, Error> {
     if !path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let text = fs::read_to_string(&path).map_err(|_| Error::invalid("could not read the history cursor"))?;
-    serde_json::from_str(&text).map(Some).map_err(|_| Error::invalid("history cursor is unreadable"))
-}
-
-fn read_base(root: &Path, project: &str, version: &str) -> Result<Option<crate::model::Snapshot>, Error> {
-    let path = base_path(root, project, version);
-    if !path.exists() {
-        return Ok(None);
+    let text = fs::read_to_string(path).map_err(|_| Error::invalid("could not read comments"))?;
+    #[derive(Deserialize)]
+    struct File {
+        comments: Vec<Comment>,
     }
-    let text = fs::read_to_string(&path).map_err(|_| Error::invalid("could not read the base cut"))?;
-    serde_json::from_str(&text).map(Some).map_err(|_| Error::invalid("base cut is unreadable"))
+    serde_json::from_str::<File>(&text).map(|f| f.comments).map_err(|_| Error::invalid("comments are unreadable"))
 }
 
-fn base_path(root: &Path, project: &str, version: &str) -> PathBuf {
-    root.join("history").join(project).join(format!("{version}.base.json"))
-}
-
-fn history_path(root: &Path, project: &str, version: &str) -> PathBuf {
-    root.join("history").join(project).join(format!("{version}.jsonl"))
-}
-
-fn cursor_path(root: &Path, project: &str, version: &str) -> PathBuf {
-    root.join("history").join(project).join(format!("{version}.cursor.json"))
+pub fn write_comments(path: &Path, comments: &[Comment]) -> Result<(), Error> {
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "comments": comments })).map_err(|_| Error::invalid("could not save comments"))?;
+    atomic_write(path, &bytes)
 }

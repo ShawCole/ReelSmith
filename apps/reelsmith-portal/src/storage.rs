@@ -143,6 +143,12 @@ impl LocalStore {
         fs::read(&path).map_err(|_| Error::invalid("could not read the object"))
     }
 
+    /// Where a stored object lives on disk (the server session's path map reads it there).
+    pub fn path_of(&self, key: &str) -> Result<PathBuf, Error> {
+        validate_key(key)?;
+        Ok(self.object_path(key))
+    }
+
     fn check_parts(&self, manifest: &UploadManifest) -> Result<(), Error> {
         if manifest.parts.is_empty() {
             return Err(Error::invalid("the upload has no parts"));

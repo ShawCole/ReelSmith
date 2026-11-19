@@ -18,11 +18,18 @@ pub enum Kind {
 pub struct Error {
     pub message: String,
     pub kind: Kind,
+    /// The version's current `seq`, sent with a 409 so the page knows what to re-open.
+    pub seq: Option<u64>,
 }
 
 impl Error {
     pub fn new(kind: Kind, message: impl Into<String>) -> Self {
-        Self { message: message.into(), kind }
+        Self { message: message.into(), kind, seq: None }
+    }
+
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = Some(seq);
+        self
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {

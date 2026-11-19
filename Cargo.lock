@@ -5901,6 +5901,8 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac",
  "http-body-util",
+ "reelsmith-engine",
+ "reelsmith-format",
  "reelsmith-time",
  "serde",
  "serde_json",

@@ -1,6 +1,6 @@
 [package]
 name = "reelsmith-portal"
-description = "ReelSmith review portal: per-client projects, append-only edit history, and resumable uploads"
+description = "ReelSmith review portal: per-client projects, the real editor on review links, server replay of an append-only action log, and resumable uploads"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 reelsmith-time = { workspace = true }
+reelsmith-engine = { workspace = true }
+reelsmith-format = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

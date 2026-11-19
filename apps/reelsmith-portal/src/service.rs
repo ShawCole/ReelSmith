@@ -1,19 +1,24 @@
-//! The portal's operations: auth, projects, edits, uploads. HTTP is a thin wrapper.
+//! The portal's operations: links, boot, the action log and server replay, comments, marks,
+//! uploads. HTTP (`http.rs`) is a thin wrapper. The contract is API.md beside PLAN.md.
 
-use crate::assemble::initial_snapshot;
-use crate::brief::{self, BriefPlan, CommentExport, EditExport, FeedbackFile, UploadBrief, VersionFeedback, approval_json};
+use crate::brief::{self, BriefPlan, LengthTarget, RawFile, UploadBrief};
 use crate::error::Error;
-use crate::history::{Commit, History, client_edits};
+use crate::feedback::{self, FeedbackFile, VersionFeedback};
+use crate::history::{ActionEvent, Stacks, effective_chain, read_log, targets_of, write_log};
 use crate::ids::{self, tokens_equal};
-use crate::model::{Actor, Snapshot, Status};
-use crate::ops::{self, EditBody, EditRequest, apply_request};
-use crate::persist::{self, BrollRecord, ClientRecord, ProjectRecord, Saved, VersionRecord};
-use crate::present::{self, CompareView, Head, VersionPage};
+use crate::model::{Actor, Approval, Comment, FinalType, MAX_COMMENTS, MAX_TEXT, Mark, MediaRole, MediaTick, Region, Reply, Status, clean_text};
+use crate::persist::{self, BrollRecord, ClientRecord, MediaEntry, ProjectRecord, Saved, VersionFiles, VersionRecord};
 use crate::r2::{self, R2Config};
+use crate::replay::{self, Replayer};
 use crate::storage::{self, LocalStore, UploadManifest};
-use serde::Serialize;
+use reelsmith_engine::review::{self, Role as EngineRole};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Most commands one POST may carry.
+pub const MAX_BATCH: usize = 1_000;
 
 #[derive(Clone, Debug)]
 pub enum StorageMode {
@@ -21,12 +26,63 @@ pub enum StorageMode {
     R2(R2Config),
 }
 
-#[derive(Clone, Debug)]
+/// What a link token opens (API.md "Token kinds").
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     Admin,
     Client { client_id: String, name: String },
     Reviewer { project_id: String, client_id: String, name: String },
-    Agent { project_id: String },
+    Editor { project_id: String },
+    Watcher { project_id: String },
+}
+
+impl Role {
+    fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::Reviewer { project_id, .. } | Self::Editor { project_id } | Self::Watcher { project_id } => Some(project_id),
+            Self::Admin | Self::Client { .. } => None,
+        }
+    }
+
+    fn engine_role(&self) -> Result<EngineRole, Error> {
+        match self {
+            Self::Editor { .. } => Ok(EngineRole::Editor),
+            Self::Reviewer { .. } => Ok(EngineRole::Reviewer),
+            Self::Watcher { .. } => Ok(EngineRole::Watcher),
+            Self::Admin | Self::Client { .. } => Err(Error::forbidden("open an editor, review or watch link for the timeline")),
+        }
+    }
+
+    fn actor(&self) -> Actor {
+        match self {
+            Self::Admin => Actor { kind: crate::model::ActorKind::Admin, id: "admin".to_string(), name: "Admin".to_string() },
+            Self::Client { client_id, name } | Self::Reviewer { client_id, name, .. } => Actor::client(client_id, name),
+            Self::Editor { .. } => Actor::agent(),
+            Self::Watcher { .. } => Actor::watcher(),
+        }
+    }
+}
+
+fn role_name(role: EngineRole) -> &'static str {
+    match role {
+        EngineRole::Editor => "editor",
+        EngineRole::Reviewer => "reviewer",
+        EngineRole::Watcher => "watcher",
+    }
+}
+
+fn parse_role(name: &str) -> EngineRole {
+    match name {
+        "reviewer" => EngineRole::Reviewer,
+        "watcher" => EngineRole::Watcher,
+        _ => EngineRole::Editor,
+    }
+}
+
+/// A version in memory: its log, and (once someone edits) its server session.
+struct Live {
+    events: Vec<ActionEvent>,
+    session: Option<Replayer>,
 }
 
 pub struct Portal {
@@ -35,17 +91,133 @@ pub struct Portal {
     clients: Vec<ClientRecord>,
     projects: Vec<ProjectRecord>,
     broll: Vec<BrollRecord>,
-    histories: HashMap<(String, String), History>,
+    live: HashMap<String, Live>,
     storage: LocalStore,
     mode: StorageMode,
     max_upload: u64,
+}
+
+// ----- shapes (API.md) -----
+
+#[derive(Serialize)]
+pub struct Boot {
+    pub role: &'static str,
+    pub actor: Actor,
+    pub project: BootProject,
+    pub version: BootVersion,
+    pub versions: Vec<VersionLink>,
+    pub seq: u64,
+    pub project_url: String,
+    pub media: Vec<BootMedia>,
+}
+
+#[derive(Serialize)]
+pub struct BootProject {
+    pub id: String,
+    pub name: String,
+    pub final_type: FinalType,
+}
+
+#[derive(Serialize)]
+pub struct BootVersion {
+    pub id: String,
+    pub label: String,
+    pub status: Status,
+}
+
+#[derive(Serialize)]
+pub struct VersionLink {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Serialize)]
+pub struct BootMedia {
+    pub path: String,
+    pub url: String,
+}
+
+#[derive(Serialize)]
+pub struct HeadInfo {
+    pub seq: u64,
+    pub status: Status,
+}
+
+#[derive(Serialize)]
+pub struct ActionsSince {
+    pub seq: u64,
+    pub actions: Vec<ActionEvent>,
+}
+
+#[derive(Deserialize)]
+pub struct ActionsIn {
+    pub based_on_seq: u64,
+    pub actions: Vec<ActionIn>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ActionIn {
+    pub id: String,
+    #[serde(default = "empty_params")]
+    pub params: Value,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The page's view; the server records what its own replay saw instead.
+    #[serde(default)]
+    pub project_changed: Option<bool>,
+    #[serde(default)]
+    pub client_ts: Option<String>,
+}
+
+fn empty_params() -> Value {
+    json!({})
+}
+
+#[derive(Serialize)]
+pub struct ActionsOut {
+    pub seq: u64,
+    pub accepted: usize,
+}
+
+#[derive(Deserialize)]
+pub struct CommentIn {
+    pub start_tick: MediaTick,
+    pub end_tick: MediaTick,
+    #[serde(default)]
+    pub region: Option<Region>,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReplyIn {
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveIn {
+    pub resolved: bool,
+    #[serde(default)]
+    pub fixed_in: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MarkIn {
+    pub mark: Mark,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Deserialize)]
+pub struct StatusIn {
+    pub status: Status,
 }
 
 #[derive(Serialize)]
 pub struct Overview {
     pub clients: Vec<ClientCard>,
     pub projects: Vec<ProjectCard>,
-    pub recent: Vec<present::EventView>,
 }
 
 #[derive(Serialize)]
@@ -62,10 +234,18 @@ pub struct ProjectCard {
     pub client_name: String,
     pub name: String,
     pub final_type: String,
+    pub editor_token: String,
     pub reviewer_token: String,
-    pub agent_token: String,
-    pub versions: Vec<String>,
+    pub watcher_token: String,
+    pub versions: Vec<VersionCard>,
     pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct VersionCard {
+    pub id: String,
+    pub label: String,
+    pub status: Status,
 }
 
 #[derive(Serialize)]
@@ -81,7 +261,7 @@ pub struct HomeProject {
     pub name: String,
     pub final_type: String,
     pub reviewer_token: String,
-    pub versions: Vec<String>,
+    pub versions: Vec<VersionCard>,
 }
 
 #[derive(Serialize)]
@@ -100,52 +280,118 @@ pub enum UploadStart {
     R2 { deferred: bool, message: String, part_urls: Vec<String> },
 }
 
+#[derive(Deserialize)]
+pub struct CompleteMeta {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub duration: MediaTick,
+}
+
 impl Portal {
     pub fn open(root: PathBuf, admin_from_env: Option<String>, mode: StorageMode, max_upload: u64) -> Result<Self, Error> {
-        fs_ensure(&root)?;
+        std::fs::create_dir_all(&root).map_err(|_| Error::invalid("could not create the data directory"))?;
         let storage = LocalStore::open(root.join("storage"))?;
-        if persist::load_saved(&root)?.is_none() {
-            crate::seed::write(&root, admin_from_env.clone())?;
-        }
-        let saved = persist::load_saved(&root)?.ok_or_else(|| Error::invalid("portal database was not created"))?;
-        let admin_token = match admin_from_env {
-            Some(token) => token,
-            None => saved.admin_token.clone(),
+        let fresh = persist::load_saved(&root)?.is_none();
+        let saved = match persist::load_saved(&root)? {
+            Some(saved) => saved,
+            None => Saved { admin_token: ids::token()?, clients: Vec::new(), projects: Vec::new(), broll: Vec::new() },
         };
+        let admin_token = admin_from_env.unwrap_or_else(|| saved.admin_token.clone());
         let mut portal = Self {
             root,
             admin_token,
             clients: saved.clients,
             projects: saved.projects,
             broll: saved.broll,
-            histories: HashMap::new(),
+            live: HashMap::new(),
             storage,
             mode,
             max_upload,
         };
-        portal.load_histories()?;
+        for project in &mut portal.projects {
+            if project.watcher_token.is_empty() {
+                project.watcher_token = ids::token()?;
+            }
+        }
+        if fresh {
+            portal.seed()?;
+        }
         portal.save_meta()?;
         Ok(portal)
+    }
+
+    /// API.md "Seed": one client, Harbor & Co, and one project whose version base is the
+    /// engine's demo project.
+    fn seed(&mut self) -> Result<(), Error> {
+        let client = ClientRecord { id: ids::nid("c")?, name: "Harbor & Co".to_string(), token: ids::token()?, created_at: stamp() };
+        let brief = UploadBrief {
+            project_name: "Spring launch reel".to_string(),
+            final_type: FinalType::Reel,
+            target: Some(LengthTarget::Unspecified),
+            end_card: None,
+            version_count: 1,
+            differences: vec![],
+            use_broll: false,
+            broll_library_ids: vec![],
+            broll_uploads: vec![],
+            raw_files: vec![RawFile {
+                name: "Demo footage".to_string(),
+                width: 1920,
+                height: 1080,
+                duration: MediaTick(30 * reelsmith_time::TICKS_PER_SECOND),
+                role: MediaRole::Aroll,
+            }],
+            change_format: false,
+            explicit_width: None,
+            explicit_height: None,
+            profile_width: None,
+            profile_height: None,
+        };
+        let plan = brief::validate_brief(&brief, &[]).map_err(|_| Error::invalid("the seed brief is invalid"))?;
+        let project_id = ids::nid("p")?;
+        let version_id = ids::nid("v")?;
+        let label = plan.versions.first().map(|v| v.difference.clone()).unwrap_or_else(|| "Primary reel".to_string());
+        VersionFiles::new(&self.root, &project_id, &version_id).create(&replay::demo_project()?)?;
+        self.projects.push(ProjectRecord {
+            id: project_id,
+            client_id: client.id.clone(),
+            name: plan.project_name.clone(),
+            reviewer_token: ids::token()?,
+            editor_token: ids::token()?,
+            watcher_token: ids::token()?,
+            plan,
+            versions: vec![VersionRecord { id: version_id, label, status: Status::Ready, approval: None, media: Vec::new() }],
+            created_at: stamp(),
+        });
+        self.clients.push(client);
+        Ok(())
     }
 
     pub fn admin_token(&self) -> &str {
         &self.admin_token
     }
 
-    pub fn links(&self) -> Vec<(String, String)> {
-        let mut rows = vec![("Admin".to_string(), format!("#/admin/{}", self.admin_token))];
-        for client in &self.clients {
-            rows.push((format!("Client {}", client.name), format!("#/c/{}", client.token)));
-        }
-        for project in &self.projects {
-            rows.push((format!("Reviewer {}", project.name), format!("#/r/{}", project.reviewer_token)));
-            rows.push((format!("Editor {}", project.name), format!("#/a/{}", project.agent_token)));
-        }
-        rows
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The links to print at start-up: (label, path with the token in the fragment).
+    pub fn links(&self) -> Vec<(String, String)> {
+        let mut rows = vec![("Admin".to_string(), format!("/#/admin/{}", self.admin_token))];
+        for client in &self.clients {
+            rows.push((format!("Client {}", client.name), format!("/#/c/{}", client.token)));
+        }
+        for project in &self.projects {
+            rows.push((format!("Editor {}", project.name), format!("/edit/#{}", project.editor_token)));
+            rows.push((format!("Review {}", project.name), format!("/review/#{}", project.reviewer_token)));
+            rows.push((format!("Watch {}", project.name), format!("/watch/#{}", project.watcher_token)));
+        }
+        rows
     }
 
     pub fn authorize(&self, token: &str) -> Result<Role, Error> {
@@ -155,62 +401,341 @@ impl Portal {
         if let Some(client) = self.clients.iter().find(|client| tokens_equal(token, &client.token)) {
             return Ok(Role::Client { client_id: client.id.clone(), name: client.name.clone() });
         }
-        if let Some(project) = self.projects.iter().find(|project| tokens_equal(token, &project.reviewer_token)) {
-            let name = self.client_name(&project.client_id).unwrap_or_else(|| "Client".to_string());
-            return Ok(Role::Reviewer { project_id: project.id.clone(), client_id: project.client_id.clone(), name });
-        }
-        if let Some(project) = self.projects.iter().find(|project| tokens_equal(token, &project.agent_token)) {
-            return Ok(Role::Agent { project_id: project.id.clone() });
+        for project in &self.projects {
+            if tokens_equal(token, &project.reviewer_token) {
+                let name = self.client_name(&project.client_id).unwrap_or_else(|| "Client".to_string());
+                return Ok(Role::Reviewer { project_id: project.id.clone(), client_id: project.client_id.clone(), name });
+            }
+            if tokens_equal(token, &project.editor_token) {
+                return Ok(Role::Editor { project_id: project.id.clone() });
+            }
+            if tokens_equal(token, &project.watcher_token) {
+                return Ok(Role::Watcher { project_id: project.id.clone() });
+            }
         }
         Err(Error::forbidden("that link does not open a project"))
     }
 
-    pub fn overview(&self, role: &Role) -> Result<Overview, Error> {
-        self.require_admin(role)?;
-        let mut recent = Vec::new();
-        for project in &self.projects {
-            for version in &project.versions {
-                if let Some(history) = self.histories.get(&(project.id.clone(), version.id.clone())) {
-                    let chain: Vec<u64> = history.chain().iter().map(|event| event.id).collect();
-                    for event in history.events.iter().rev().take(8) {
-                        recent.push(event_view(event, &chain));
+    // ----- boot and version reads -----
+
+    pub fn boot(&self, role: &Role, version: Option<&str>) -> Result<Boot, Error> {
+        let engine_role = role.engine_role()?;
+        let project_id = role.project_id().ok_or_else(|| Error::forbidden("open an editor, review or watch link"))?;
+        let project = self.project(project_id)?;
+        let version = match version {
+            Some(id) => project.versions.iter().find(|v| v.id == id).ok_or_else(|| Error::forbidden("that version is not part of this link's project"))?,
+            None => project.versions.first().ok_or_else(|| Error::not_found("this project has no versions"))?,
+        };
+        let shown = if engine_role == EngineRole::Reviewer && version.status == Status::AgentWorking { EngineRole::Watcher } else { engine_role };
+        Ok(Boot {
+            role: role_name(shown),
+            actor: role.actor(),
+            project: BootProject { id: project.id.clone(), name: project.name.clone(), final_type: project.plan.final_type },
+            version: BootVersion { id: version.id.clone(), label: version.label.clone(), status: version.status },
+            versions: project.versions.iter().map(|v| VersionLink { id: v.id.clone(), label: v.label.clone() }).collect(),
+            seq: self.seq_of(&project.id, &version.id)?,
+            project_url: format!("/api/v/{}/project", version.id),
+            media: version.media.iter().enumerate().map(|(n, m)| BootMedia { path: m.path.clone(), url: format!("/api/v/{}/media/{n}", version.id) }).collect(),
+        })
+    }
+
+    /// The head `.fcproj` bytes and the seq they are at.
+    pub fn project_file(&self, role: &Role, version_id: &str) -> Result<(Vec<u8>, u64), Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let (project_id, version_id) = self.ids(pi, vi);
+        let bytes = std::fs::read(self.files(&project_id, &version_id).head()).map_err(|_| Error::not_found("this version has no cut yet"))?;
+        Ok((bytes, self.seq_of(&project_id, &version_id)?))
+    }
+
+    pub fn head(&self, role: &Role, version_id: &str) -> Result<HeadInfo, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let (project_id, version_id) = self.ids(pi, vi);
+        Ok(HeadInfo { seq: self.seq_of(&project_id, &version_id)?, status: self.projects[pi].versions[vi].status })
+    }
+
+    pub fn actions_since(&mut self, role: &Role, version_id: &str, since: u64) -> Result<ActionsSince, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let live = self.live(pi, vi)?;
+        Ok(ActionsSince { seq: live.events.len() as u64, actions: live.events.iter().filter(|e| e.seq > since).cloned().collect() })
+    }
+
+    pub fn media(&self, role: &Role, version_id: &str, n: usize) -> Result<Vec<u8>, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let entry = self.projects[pi].versions[vi].media.get(n).ok_or_else(|| Error::not_found("no such media file"))?;
+        match role {
+            Role::Editor { .. } => self.storage.read(&entry.key),
+            _ => match &entry.proxy_key {
+                Some(key) => self.storage.read(key),
+                None => Err(Error::forbidden("review links get proxies, and this file has none yet")),
+            },
+        }
+    }
+
+    // ----- the action log (server replay) -----
+
+    /// API.md `POST /api/v/{version}/actions`: gate every command, then replay the batch in
+    /// order on the version's session. Any failure leaves nothing behind: the session is
+    /// rebuilt from the last good state and the answer is 409.
+    pub fn post_actions(&mut self, role: &Role, version_id: &str, body: ActionsIn) -> Result<ActionsOut, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let engine_role = role.engine_role()?;
+        if engine_role == EngineRole::Reviewer && self.projects[pi].versions[vi].status == Status::AgentWorking {
+            return Err(Error::locked("your editor is working; the cut is read-only until it is marked ready"));
+        }
+        if body.actions.is_empty() {
+            return Err(Error::invalid("the batch has no commands"));
+        }
+        if body.actions.len() > MAX_BATCH {
+            return Err(Error::invalid(format!("a batch holds at most {MAX_BATCH} commands")));
+        }
+        let seq = self.live(pi, vi)?.events.len() as u64;
+        if body.based_on_seq != seq {
+            return Err(Error::conflict(format!("this cut was updated (step {seq}); re-open it and redo your change")).with_seq(seq));
+        }
+        for action in &body.actions {
+            if action.id.starts_with("portal.") {
+                return Err(Error::forbidden(format!("{}: portal actions have their own routes", action.id)));
+            }
+            review::allows(engine_role, &action.id).map_err(|why| Error::forbidden(format!("{}: {why}", action.id)))?;
+        }
+        let actor = role.actor();
+        let reason = body.reason.as_ref().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        if let Some(reason) = &reason
+            && reason.chars().count() > MAX_TEXT
+        {
+            return Err(Error::invalid("the reason is too long"));
+        }
+        self.ensure_session(pi, vi)?;
+        let (project_id, vid) = self.ids(pi, vi);
+        let files = self.files(&project_id, &vid);
+        let at = stamp();
+        let outcome = {
+            let live = self.live.get_mut(&vid).ok_or_else(|| Error::not_found("no version"))?;
+            let session = live.session.as_mut().ok_or_else(|| Error::invalid("the version's session is not open"))?;
+            let mut stacks = Stacks::of(&live.events);
+            let mut added: Vec<ActionEvent> = Vec::new();
+            let mut failure = None;
+            for action in body.actions {
+                let targets = targets_of(&action.params);
+                match session.run(engine_role, &action.id, action.params.clone()) {
+                    Ok(ran) => {
+                        if engine_role == EngineRole::Editor
+                            && ran.project_changed
+                            && reason.is_none()
+                            && let Some(target) = overwrites_client(&live.events, &targets)
+                        {
+                            failure = Some(Error::conflict(format!("{} changes {target}, which a client edited last; send a reason", action.id)));
+                            break;
+                        }
+                        let reverts_seq = if ran.project_changed { stacks.reverts(&action.id) } else { None };
+                        let event = ActionEvent {
+                            seq: seq + added.len() as u64 + 1,
+                            at: at.clone(),
+                            actor: actor.clone(),
+                            role: role_name(engine_role).to_string(),
+                            id: action.id,
+                            params: action.params,
+                            label: if ran.label.is_empty() { action.label.unwrap_or_default() } else { ran.label },
+                            project_changed: ran.project_changed,
+                            based_on_seq: seq,
+                            reason: reason.clone(),
+                            client_ts: action.client_ts,
+                            reverts_seq,
+                            targets,
+                        };
+                        stacks.push(&event);
+                        added.push(event);
+                    }
+                    Err(why) => {
+                        failure = Some(Error::conflict(format!("{} could not be applied ({why}); nothing in this batch was kept", action.id)));
+                        break;
                     }
                 }
             }
+            match failure {
+                Some(error) => Err(error),
+                None => {
+                    let changed = added.iter().any(|e| e.project_changed);
+                    let mut all = live.events.clone();
+                    all.extend(added);
+                    let written = write_log(&files.actions(), &all).and_then(|()| if changed { storage::atomic_write(&files.head(), &session.project_bytes()) } else { Ok(()) });
+                    written.map(|()| all)
+                }
+            }
+        };
+        match outcome {
+            Ok(all) => {
+                let accepted = all.len() - seq as usize;
+                let new_seq = all.len() as u64;
+                if let Some(live) = self.live.get_mut(&vid) {
+                    live.events = all;
+                }
+                self.write_feedback(pi, vi)?;
+                Ok(ActionsOut { seq: new_seq, accepted })
+            }
+            Err(error) => {
+                // Rebuild from the last good state on next use (base + the log as written).
+                self.live.remove(&vid);
+                Err(Error { seq: Some(seq), ..error })
+            }
         }
-        recent.sort_by(|a, b| b.at.cmp(&a.at).then(b.id.cmp(&a.id)));
-        recent.truncate(12);
+    }
+
+    // ----- comments, marks, status (portal actions) -----
+
+    pub fn comments(&self, role: &Role, version_id: &str) -> Result<Vec<Comment>, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let (project_id, version_id) = self.ids(pi, vi);
+        persist::read_comments(&self.files(&project_id, &version_id).comments())
+    }
+
+    pub fn add_comment(&mut self, role: &Role, version_id: &str, body: CommentIn) -> Result<Comment, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        no_watchers(role)?;
+        let text = clean_text(&body.body, MAX_TEXT, "comment")?;
+        if body.start_tick.0 < 0 || body.end_tick.0 < body.start_tick.0 {
+            return Err(Error::invalid("a comment's end is before its start"));
+        }
+        let region = body.region.map(Region::checked).transpose()?;
+        let (project_id, vid) = self.ids(pi, vi);
+        let path = self.files(&project_id, &vid).comments();
+        let mut comments = persist::read_comments(&path)?;
+        if comments.len() >= MAX_COMMENTS {
+            return Err(Error::invalid("this version has too many comments"));
+        }
+        let comment = Comment {
+            id: ids::nid("cm")?,
+            author: role.actor(),
+            at: stamp(),
+            start_tick: body.start_tick,
+            end_tick: body.end_tick,
+            region,
+            body: text,
+            resolved: false,
+            fixed_in: None,
+            replies: Vec::new(),
+        };
+        comments.push(comment.clone());
+        persist::write_comments(&path, &comments)?;
+        let params = json!({"comment": comment.id, "body": comment.body, "start_tick": comment.start_tick, "end_tick": comment.end_tick, "region": comment.region});
+        self.log_portal(pi, vi, role, "portal.comment", params, "Comment")?;
+        Ok(comment)
+    }
+
+    pub fn reply(&mut self, role: &Role, version_id: &str, comment_id: &str, body: ReplyIn) -> Result<Comment, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        no_watchers(role)?;
+        let text = clean_text(&body.body, MAX_TEXT, "reply")?;
+        let author = role.actor();
+        let comment = self.change_comment(pi, vi, comment_id, |c| {
+            c.replies.push(Reply { author, at: stamp(), body: text.clone() });
+            Ok(())
+        })?;
+        self.log_portal(pi, vi, role, "portal.reply", json!({"comment": comment_id, "body": text}), "Reply")?;
+        Ok(comment)
+    }
+
+    pub fn resolve(&mut self, role: &Role, version_id: &str, comment_id: &str, body: ResolveIn) -> Result<Comment, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        no_watchers(role)?;
+        let fixed_in = body.fixed_in.as_deref().map(|f| clean_text(f, MAX_TEXT, "fixed in")).transpose()?;
+        let comment = self.change_comment(pi, vi, comment_id, |c| {
+            c.resolved = body.resolved;
+            c.fixed_in = fixed_in.clone();
+            Ok(())
+        })?;
+        let label = if body.resolved { "Resolve comment" } else { "Reopen comment" };
+        self.log_portal(pi, vi, role, "portal.resolve", json!({"comment": comment_id, "resolved": body.resolved, "fixed_in": fixed_in}), label)?;
+        Ok(comment)
+    }
+
+    /// Reviewer only: the client's Approve / Request changes. Writes approval.json and
+    /// feedback.json.
+    pub fn mark(&mut self, role: &Role, version_id: &str, body: MarkIn) -> Result<Value, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        let Role::Reviewer { name, .. } = role else {
+            return Err(Error::forbidden("approval is the client's mark"));
+        };
+        let note = body.note.trim().to_string();
+        if note.chars().count() > MAX_TEXT {
+            return Err(Error::invalid("the note is too long"));
+        }
+        let approval = Approval { mark: body.mark, note: note.clone(), by: name.clone(), at: stamp() };
+        {
+            let version = &mut self.projects[pi].versions[vi];
+            version.approval = Some(approval.clone());
+            version.status = match body.mark {
+                Mark::Good => Status::Approved,
+                Mark::NotGood => Status::ChangesRequested,
+            };
+        }
+        self.save_meta()?;
+        let label = match body.mark {
+            Mark::Good => "Approve",
+            Mark::NotGood => "Request changes",
+        };
+        self.log_portal(pi, vi, role, "portal.mark", json!({"mark": body.mark, "note": note}), label)?;
+        Ok(serde_json::to_value(feedback::approval_json(&self.projects[pi].versions[vi].label, &approval)).unwrap_or(Value::Null))
+    }
+
+    /// Editor only: `agent_working` locks review links, `ready` hands the cut back.
+    pub fn set_status(&mut self, role: &Role, version_id: &str, body: StatusIn) -> Result<HeadInfo, Error> {
+        let (pi, vi) = self.version_index(role, version_id)?;
+        if !matches!(role, Role::Editor { .. }) {
+            return Err(Error::forbidden("only the editor link sets the status"));
+        }
+        if !matches!(body.status, Status::AgentWorking | Status::Ready) {
+            return Err(Error::invalid("status must be agent_working or ready"));
+        }
+        self.projects[pi].versions[vi].status = body.status;
+        self.save_meta()?;
+        let label = if body.status == Status::AgentWorking { "Editor working" } else { "Ready for review" };
+        self.log_portal(pi, vi, role, "portal.status", json!({"status": body.status}), label)?;
+        let (project_id, vid) = self.ids(pi, vi);
+        Ok(HeadInfo { seq: self.seq_of(&project_id, &vid)?, status: body.status })
+    }
+
+    pub fn feedback(&self, role: &Role) -> Result<FeedbackFile, Error> {
+        let project_id = role.project_id().ok_or_else(|| Error::forbidden("open an editor, review or watch link"))?;
+        let pi = self.projects.iter().position(|p| p.id == project_id).ok_or_else(|| Error::not_found("no project"))?;
+        let versions = (0..self.projects[pi].versions.len()).map(|vi| self.version_feedback(pi, vi)).collect::<Result<Vec<_>, _>>()?;
+        Ok(self.feedback_file(pi, versions))
+    }
+
+    // ----- admin, client home, projects -----
+
+    pub fn overview(&self, role: &Role) -> Result<Overview, Error> {
+        if !matches!(role, Role::Admin) {
+            return Err(Error::forbidden("the dashboard is for the admin link"));
+        }
         Ok(Overview {
             clients: self
                 .clients
                 .iter()
-                .map(|client| ClientCard {
-                    id: client.id.clone(),
-                    name: client.name.clone(),
-                    token: client.token.clone(),
-                    created_at: client.created_at.clone(),
-                })
+                .map(|c| ClientCard { id: c.id.clone(), name: c.name.clone(), token: c.token.clone(), created_at: c.created_at.clone() })
                 .collect(),
             projects: self
                 .projects
                 .iter()
-                .map(|project| ProjectCard {
-                    id: project.id.clone(),
-                    client_name: self.client_name(&project.client_id).unwrap_or_else(|| "Client".to_string()),
-                    name: project.name.clone(),
-                    final_type: project.plan.final_type.as_str().to_string(),
-                    reviewer_token: project.reviewer_token.clone(),
-                    agent_token: project.agent_token.clone(),
-                    versions: project.versions.iter().map(|version| version.difference.clone()).collect(),
-                    created_at: project.created_at.clone(),
+                .map(|p| ProjectCard {
+                    id: p.id.clone(),
+                    client_name: self.client_name(&p.client_id).unwrap_or_else(|| "Client".to_string()),
+                    name: p.name.clone(),
+                    final_type: p.plan.final_type.as_str().to_string(),
+                    editor_token: p.editor_token.clone(),
+                    reviewer_token: p.reviewer_token.clone(),
+                    watcher_token: p.watcher_token.clone(),
+                    versions: version_cards(p),
+                    created_at: p.created_at.clone(),
                 })
                 .collect(),
-            recent,
         })
     }
 
     pub fn create_client(&mut self, role: &Role, name: &str) -> Result<ClientCard, Error> {
-        self.require_admin(role)?;
+        if !matches!(role, Role::Admin) {
+            return Err(Error::forbidden("only the admin link adds clients"));
+        }
         let name = crate::model::clean_name(name, "client name")?;
         let client = ClientRecord { id: ids::nid("c")?, name: name.clone(), token: ids::token()?, created_at: stamp() };
         let card = ClientCard { id: client.id.clone(), name, token: client.token.clone(), created_at: client.created_at.clone() };
@@ -220,76 +745,60 @@ impl Portal {
     }
 
     pub fn home(&self, role: &Role) -> Result<Home, Error> {
-        let client_id = self.client_scope(role)?;
-        let client_name = self.client_name(&client_id).unwrap_or_else(|| "Client".to_string());
+        let Role::Client { client_id, name } = role else {
+            return Err(Error::forbidden("open a client link"));
+        };
         let projects = self
             .projects
             .iter()
-            .filter(|project| project.client_id == client_id)
-            .map(|project| HomeProject {
-                id: project.id.clone(),
-                name: project.name.clone(),
-                final_type: project.plan.final_type.as_str().to_string(),
-                reviewer_token: project.reviewer_token.clone(),
-                versions: project.versions.iter().map(|version| version.difference.clone()).collect(),
+            .filter(|p| &p.client_id == client_id)
+            .map(|p| HomeProject {
+                id: p.id.clone(),
+                name: p.name.clone(),
+                final_type: p.plan.final_type.as_str().to_string(),
+                reviewer_token: p.reviewer_token.clone(),
+                versions: version_cards(p),
             })
             .collect();
         let broll = self
             .broll
             .iter()
-            .filter(|item| item.client_id == client_id)
-            .map(|item| HomeBroll {
-                id: item.id.clone(),
-                name: item.name.clone(),
-                width: item.width,
-                height: item.height,
-                duration_ticks: item.duration.0.to_string(),
-            })
+            .filter(|b| &b.client_id == client_id)
+            .map(|b| HomeBroll { id: b.id.clone(), name: b.name.clone(), width: b.width, height: b.height, duration_ticks: b.duration.0.to_string() })
             .collect();
-        Ok(Home { client_name, projects, broll })
+        Ok(Home { client_name: name.clone(), projects, broll })
     }
 
-    pub fn check_brief(&self, role: &Role, brief: &UploadBrief) -> Result<BriefPlan, Vec<crate::brief::FieldError>> {
+    pub fn check_brief(&self, role: &Role, brief: &UploadBrief) -> Result<BriefPlan, Vec<brief::FieldError>> {
         let client_id = match self.client_scope(role) {
             Ok(id) => id,
-            Err(error) => return Err(vec![crate::brief::FieldError { field: "auth".to_string(), message: error.message }]),
+            Err(error) => return Err(vec![brief::FieldError { field: "auth".to_string(), message: error.message }]),
         };
-        let known = self.known_broll(&client_id);
-        brief::validate_brief(brief, &known)
+        brief::validate_brief(brief, &self.known_broll(&client_id))
     }
 
+    /// A client's upload form: a project with one version per planned version. Each version's
+    /// base is an empty project until the editor assembles the first cut.
     pub fn create_project(&mut self, role: &Role, brief: UploadBrief) -> Result<HomeProject, Error> {
-        let client_id = self.client_scope(role)?;
-        let known = self.known_broll(&client_id);
-        let plan = brief::validate_brief(&brief, &known)
-            .map_err(|errors| Error::invalid(errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; ")))?;
-        let library: Vec<BrollRecord> = self.broll.iter().filter(|item| item.client_id == client_id).cloned().collect();
-        let snapshot = initial_snapshot(&plan, &library)?;
+        let Role::Client { client_id, .. } = role else {
+            return Err(Error::forbidden("projects are created from a client link"));
+        };
+        let plan = brief::validate_brief(&brief, &self.known_broll(client_id))
+            .map_err(|errors| Error::invalid(errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; ")))?;
         let project_id = ids::nid("p")?;
         let mut versions = Vec::new();
-        let mut histories = Vec::new();
         for planned in &plan.versions {
-            let version_id = ids::nid("v")?;
-            let mut history = History::new(blank_like(&snapshot)?);
-            history.commit(Commit {
-                actor: Actor::Agent,
-                at: stamp(),
-                action: crate::model::action::ASSEMBLE.to_string(),
-                targets: snapshot.timeline.clips.iter().map(|clip| clip.id.clone()).collect(),
-                summary: format!("Assembled {}", planned.difference),
-                reason: None,
-                after: snapshot.clone(),
-                relates_to: None,
-            })?;
-            versions.push(VersionRecord { id: version_id.clone(), difference: planned.difference.clone() });
-            histories.push((version_id, history));
+            let id = ids::nid("v")?;
+            VersionFiles::new(&self.root, &project_id, &id).create(&replay::empty_project(&format!("{} - {}", plan.project_name, planned.difference)))?;
+            versions.push(VersionRecord { id, label: planned.difference.clone(), status: Status::Draft, approval: None, media: Vec::new() });
         }
         let project = ProjectRecord {
-            id: project_id.clone(),
-            client_id,
+            id: project_id,
+            client_id: client_id.clone(),
             name: plan.project_name.clone(),
             reviewer_token: ids::token()?,
-            agent_token: ids::token()?,
+            editor_token: ids::token()?,
+            watcher_token: ids::token()?,
             plan,
             versions,
             created_at: stamp(),
@@ -299,83 +808,14 @@ impl Portal {
             name: project.name.clone(),
             final_type: project.plan.final_type.as_str().to_string(),
             reviewer_token: project.reviewer_token.clone(),
-            versions: project.versions.iter().map(|version| version.difference.clone()).collect(),
+            versions: version_cards(&project),
         };
-        for (version_id, history) in &histories {
-            persist::save_history(&self.root, &project.id, version_id, history)?;
-            self.histories.insert((project.id.clone(), version_id.clone()), history.clone());
-        }
         self.projects.push(project);
         self.save_meta()?;
         Ok(home)
     }
 
-    pub fn workspace(&self, role: &Role, version_id: Option<&str>) -> Result<VersionPage, Error> {
-        let project_id = self.project_scope(role)?.to_string();
-        let version_id = self.resolve_version(&project_id, version_id)?;
-        self.page(role, &project_id, &version_id)
-    }
-
-    pub fn head(&self, role: &Role, version_id: &str) -> Result<Head, Error> {
-        let project_id = self.project_scope(role)?.to_string();
-        let history = self.history(&project_id, version_id)?;
-        present::head(history)
-    }
-
-    pub fn edit(&mut self, role: &Role, version_id: &str, body: EditBody) -> Result<VersionPage, Error> {
-        let project_id = self.project_scope(role)?.to_string();
-        let actor = self.actor(role, &project_id)?;
-        let actor_name = actor.label();
-        let at = stamp();
-        let root = self.root.clone();
-        {
-            let history = self.histories.get_mut(&(project_id.clone(), version_id.to_string())).ok_or_else(|| Error::not_found("no version"))?;
-            let status = history.current()?.status;
-            guard(role, status, &body.edit)?;
-            match &body.edit {
-                EditRequest::Undo => {
-                    history.undo(actor.clone(), at.clone(), body.reason.clone())?;
-                }
-                EditRequest::Redo => {
-                    history.redo(actor.clone(), at.clone())?;
-                }
-                EditRequest::Restore { event_id } => {
-                    history.restore(actor.clone(), at.clone(), *event_id, body.reason.clone())?;
-                }
-                other => {
-                    let snapshot = history.current()?;
-                    let applied = apply_request(&snapshot, &actor_name, &at, other)?;
-                    history.commit(Commit {
-                        actor,
-                        at,
-                        action: applied.action.to_string(),
-                        targets: applied.targets,
-                        summary: applied.summary,
-                        reason: body.reason,
-                        after: applied.after,
-                        relates_to: None,
-                    })?;
-                }
-            }
-            persist::save_history(&root, &project_id, version_id, history)?;
-        }
-        self.write_feedback(&project_id, version_id)?;
-        self.page(role, &project_id, version_id)
-    }
-
-    pub fn compare(&self, role: &Role, left: &str, right: &str) -> Result<CompareView, Error> {
-        let project_id = self.project_scope(role)?.to_string();
-        let left_diff = self.version_difference(&project_id, left)?;
-        let right_diff = self.version_difference(&project_id, right)?;
-        let left_snap = self.history(&project_id, left)?.current()?;
-        let right_snap = self.history(&project_id, right)?.current()?;
-        present::compare(&left_diff, &right_diff, &left_snap, &right_snap)
-    }
-
-    pub fn feedback(&self, role: &Role) -> Result<FeedbackFile, Error> {
-        let project_id = self.project_scope(role)?.to_string();
-        self.feedback_file(&project_id)
-    }
+    // ----- uploads (PR #5, unchanged rules) -----
 
     pub fn begin_upload(&self, role: &Role, filename: &str, media_role: &str, total_size: u64) -> Result<UploadStart, Error> {
         let client_id = self.client_scope(role)?;
@@ -396,8 +836,7 @@ impl Portal {
                 let key = format!("c/{client_id}/{media_role}/{safe}");
                 let when = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
                 let mut part_urls = Vec::new();
-                let parts = count.min(8);
-                for _ in 0..parts {
+                for _ in 0..count.min(8) {
                     part_urls.push(r2::presign_put(config, &key, &when, 3600)?);
                 }
                 Ok(UploadStart::R2 {
@@ -412,21 +851,21 @@ impl Portal {
     pub fn write_part(&self, role: &Role, upload_id: &str, part: u32, bytes: &[u8]) -> Result<UploadManifest, Error> {
         let client_id = self.client_scope(role)?;
         let manifest = self.storage.status(upload_id)?;
-        self.owns_key(&client_id, &manifest.key)?;
+        owns_key(&client_id, &manifest.key)?;
         self.storage.write_part(upload_id, part, bytes)
     }
 
     pub fn upload_status(&self, role: &Role, upload_id: &str) -> Result<UploadManifest, Error> {
         let client_id = self.client_scope(role)?;
         let manifest = self.storage.status(upload_id)?;
-        self.owns_key(&client_id, &manifest.key)?;
+        owns_key(&client_id, &manifest.key)?;
         Ok(manifest)
     }
 
     pub fn complete_upload(&mut self, role: &Role, upload_id: &str, meta: CompleteMeta) -> Result<UploadManifest, Error> {
         let client_id = self.client_scope(role)?;
         let current = self.storage.status(upload_id)?;
-        self.owns_key(&client_id, &current.key)?;
+        owns_key(&client_id, &current.key)?;
         let already = current.complete;
         let manifest = self.storage.complete(upload_id)?;
         if manifest.role == "broll" && !already {
@@ -440,128 +879,161 @@ impl Portal {
         Ok(manifest)
     }
 
-    pub fn read_object(&self, role: &Role, key: &str) -> Result<Vec<u8>, Error> {
-        match role {
-            Role::Reviewer { .. } | Role::Client { .. } => Err(Error::forbidden("reviewers watch the proxy timeline; raw uploads stay in storage")),
-            Role::Agent { project_id } => {
-                let project = self.project(project_id)?;
-                self.owns_key(&project.client_id, key)?;
-                self.storage.read(key)
+    // ----- internals -----
+
+    /// The project and version indexes of `version_id`, refusing (403) a token for another project.
+    fn version_index(&self, role: &Role, version_id: &str) -> Result<(usize, usize), Error> {
+        let token_project = role.project_id().ok_or_else(|| Error::forbidden("open an editor, review or watch link"))?;
+        for (pi, project) in self.projects.iter().enumerate() {
+            if let Some(vi) = project.versions.iter().position(|v| v.id == version_id) {
+                if project.id != token_project {
+                    return Err(Error::forbidden("that version belongs to another project"));
+                }
+                return Ok((pi, vi));
             }
-            Role::Admin => self.storage.read(key),
+        }
+        Err(Error::not_found("no such version"))
+    }
+
+    fn ids(&self, pi: usize, vi: usize) -> (String, String) {
+        (self.projects[pi].id.clone(), self.projects[pi].versions[vi].id.clone())
+    }
+
+    fn files(&self, project_id: &str, version_id: &str) -> VersionFiles {
+        VersionFiles::new(&self.root, project_id, version_id)
+    }
+
+    fn seq_of(&self, project_id: &str, version_id: &str) -> Result<u64, Error> {
+        match self.live.get(version_id) {
+            Some(live) => Ok(live.events.len() as u64),
+            None => Ok(read_log(&self.files(project_id, version_id).actions())?.len() as u64),
         }
     }
 
-    fn page(&self, role: &Role, project_id: &str, version_id: &str) -> Result<VersionPage, Error> {
-        let project_name = self.project(project_id)?.name.clone();
-        let client_id = self.project(project_id)?.client_id.clone();
-        let client_name = self.client_name(&client_id).unwrap_or_else(|| "Client".to_string());
-        let plan = self.project(project_id)?.plan.clone();
-        let version_rows: Vec<(String, String)> =
-            self.project(project_id)?.versions.iter().map(|version| (version.id.clone(), version.difference.clone())).collect();
-        let difference = version_rows.iter().find(|(id, _)| id == version_id).map(|(_, name)| name.clone()).unwrap_or_default();
-        let mut tabs = Vec::new();
-        for (id, name) in &version_rows {
-            let current = self.histories.get(&(project_id.to_string(), id.clone())).and_then(|history| history.current().ok());
-            let status = current.as_ref().map(|snap| snap.status).unwrap_or(Status::Draft);
-            let mark = current.as_ref().and_then(|snap| snap.approval.as_ref().map(|approval| approval.mark.as_str().to_string()));
-            tabs.push(present::VersionTab { id: id.clone(), difference: name.clone(), status, mark });
+    fn live(&mut self, pi: usize, vi: usize) -> Result<&mut Live, Error> {
+        let (project_id, version_id) = self.ids(pi, vi);
+        if !self.live.contains_key(&version_id) {
+            let events = read_log(&self.files(&project_id, &version_id).actions())?;
+            self.live.insert(version_id.clone(), Live { events, session: None });
         }
-        let history = self.history(project_id, version_id)?;
-        let snapshot = history.current()?;
-        let agent = matches!(role, Role::Agent { .. } | Role::Admin);
-        let read_only = matches!(role, Role::Reviewer { .. } | Role::Client { .. }) && snapshot.status == Status::AgentWorking;
-        Ok(VersionPage {
-            project_id: project_id.to_string(),
-            project_name,
-            client_name,
-            role: role_name(role).to_string(),
-            read_only,
-            read_only_reason: if read_only { "Your editor is working. This cut is read-only until it's marked ready.".to_string() } else { String::new() },
-            brief: present::BriefSummary {
-                final_type: plan.final_type.as_str().to_string(),
-                target: plan.target.label(),
-                aspect_label: plan.aspect.ratio.label(),
-                aspect_source: aspect_source_name(plan.aspect.source).to_string(),
-                use_broll: !matches!(plan.broll, brief::BrollChoice::None),
-                flags: plan.flags.clone(),
-            },
-            versions: tabs,
-            version: present::version_body(version_id, &difference, history, &plan, agent)?,
-        })
+        self.live.get_mut(&version_id).ok_or_else(|| Error::not_found("no version"))
     }
 
-    fn feedback_file(&self, project_id: &str) -> Result<FeedbackFile, Error> {
-        let project = self.project(project_id)?;
-        let mut versions = Vec::new();
-        for version in &project.versions {
-            let history = self.history(project_id, &version.id)?;
-            let snapshot = history.current()?;
-            let comments = snapshot
-                .comments
-                .iter()
-                .map(|comment| CommentExport {
-                    body: comment.body.clone(),
-                    start_ticks: comment.start.0.to_string(),
-                    end_ticks: comment.end.0.to_string(),
-                    region: comment.region,
-                    resolved: comment.resolved,
-                    fixed_in: comment.fixed_in.clone(),
-                })
-                .collect();
-            let client_edits = client_edits(history)
-                .iter()
-                .map(|event| EditExport {
-                    action: event.action.clone(),
-                    targets: event.targets.clone(),
-                    summary: event.summary.clone(),
-                    at: event.at.clone(),
-                    before_frames: frame_notes(&event.before, &event.targets),
-                    after_frames: frame_notes(&event.after, &event.targets),
-                })
-                .collect();
-            versions.push(VersionFeedback {
-                approval: approval_json(&version.difference, &snapshot),
-                difference: version.difference.clone(),
-                comments,
-                client_edits,
-            });
+    /// Open the version's server session: base + replay of the log. If the log no longer
+    /// replays (an engine change), open the saved head instead.
+    fn ensure_session(&mut self, pi: usize, vi: usize) -> Result<(), Error> {
+        let (project_id, version_id) = self.ids(pi, vi);
+        let files = self.files(&project_id, &version_id);
+        let media = self.media_map(pi, vi)?;
+        let live = self.live(pi, vi)?;
+        if live.session.is_some() {
+            return Ok(());
         }
-        Ok(FeedbackFile {
-            schema: "reelsmith.portal.feedback/1".to_string(),
+        let mut session = Replayer::open(&files.base(), &media)?;
+        for event in live.events.iter().filter(|e| !e.is_portal()) {
+            if session.run(parse_role(&event.role), &event.id, event.params.clone()).is_err() {
+                session = Replayer::open(&files.head(), &media)?;
+                break;
+            }
+        }
+        live.session = Some(session);
+        Ok(())
+    }
+
+    fn media_map(&self, pi: usize, vi: usize) -> Result<Vec<(String, PathBuf)>, Error> {
+        self.projects[pi].versions[vi].media.iter().map(|m: &MediaEntry| Ok((m.path.clone(), self.storage.path_of(&m.key)?))).collect()
+    }
+
+    fn change_comment(&self, pi: usize, vi: usize, comment_id: &str, change: impl FnOnce(&mut Comment) -> Result<(), Error>) -> Result<Comment, Error> {
+        let (project_id, version_id) = self.ids(pi, vi);
+        let path = self.files(&project_id, &version_id).comments();
+        let mut comments = persist::read_comments(&path)?;
+        let comment = comments.iter_mut().find(|c| c.id == comment_id).ok_or_else(|| Error::not_found("no such comment"))?;
+        if comment.replies.len() >= MAX_COMMENTS {
+            return Err(Error::invalid("this thread is full"));
+        }
+        change(comment)?;
+        let out = comment.clone();
+        persist::write_comments(&path, &comments)?;
+        Ok(out)
+    }
+
+    /// Append a portal action (not replayed) and refresh feedback.json.
+    fn log_portal(&mut self, pi: usize, vi: usize, role: &Role, id: &str, params: Value, label: &str) -> Result<u64, Error> {
+        let engine_role = role.engine_role()?;
+        let (project_id, version_id) = self.ids(pi, vi);
+        let path = self.files(&project_id, &version_id).actions();
+        let actor = role.actor();
+        let live = self.live(pi, vi)?;
+        let seq = live.events.len() as u64;
+        let event = ActionEvent {
+            seq: seq + 1,
+            at: stamp(),
+            actor,
+            role: role_name(engine_role).to_string(),
+            id: id.to_string(),
+            params,
+            label: label.to_string(),
+            project_changed: false,
+            based_on_seq: seq,
+            reason: None,
+            client_ts: None,
+            reverts_seq: None,
+            targets: Vec::new(),
+        };
+        let mut all = live.events.clone();
+        all.push(event);
+        write_log(&path, &all)?;
+        live.events = all;
+        self.write_feedback(pi, vi)?;
+        Ok(seq + 1)
+    }
+
+    fn version_feedback(&self, pi: usize, vi: usize) -> Result<VersionFeedback, Error> {
+        let (project_id, version_id) = self.ids(pi, vi);
+        let files = self.files(&project_id, &version_id);
+        let version = &self.projects[pi].versions[vi];
+        let events = match self.live.get(&version_id) {
+            Some(live) => live.events.clone(),
+            None => read_log(&files.actions())?,
+        };
+        let comments = persist::read_comments(&files.comments())?;
+        let base = std::fs::read(files.base()).ok().and_then(|b| replay::project_content(&b));
+        let head = std::fs::read(files.head()).ok().and_then(|b| replay::project_content(&b));
+        Ok(feedback::version_feedback(
+            &version.id,
+            &version.label,
+            version.status.as_str(),
+            version.approval.as_ref(),
+            &comments,
+            &events,
+            base.as_ref(),
+            head.as_ref(),
+        ))
+    }
+
+    fn feedback_file(&self, pi: usize, versions: Vec<VersionFeedback>) -> FeedbackFile {
+        let project = &self.projects[pi];
+        FeedbackFile {
+            schema: feedback::SCHEMA.to_string(),
             client: self.client_name(&project.client_id).unwrap_or_else(|| "Client".to_string()),
             project: project.name.clone(),
             final_type: project.plan.final_type,
             versions,
-        })
-    }
-
-    fn write_feedback(&self, project_id: &str, version_id: &str) -> Result<(), Error> {
-        let file = self.feedback_file(project_id)?;
-        let project = self.project(project_id)?;
-        let difference = self.version_difference(project_id, version_id)?;
-        let dir = self.root.join("feedback").join(project_id).join(version_id);
-        std::fs::create_dir_all(&dir)?;
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|_| Error::invalid("could not write feedback"))?;
-        storage::atomic_write(&dir.join("feedback.json"), &bytes)?;
-        if let Some(version) = file.versions.iter().find(|version| version.difference == difference)
-            && let Some(approval) = &version.approval
-        {
-            let bytes = serde_json::to_vec_pretty(approval).map_err(|_| Error::invalid("could not write approval"))?;
-            storage::atomic_write(&dir.join("approval.json"), &bytes)?;
         }
-        let _ = project;
-        Ok(())
     }
 
-    fn load_histories(&mut self) -> Result<(), Error> {
-        let pairs: Vec<(String, String)> =
-            self.projects.iter().flat_map(|project| project.versions.iter().map(|version| (project.id.clone(), version.id.clone()))).collect();
-        for (project_id, version_id) in pairs {
-            let fallback =
-                blank_like(&Snapshot::new(crate::model::Timeline::blank(1920, 1080, crate::model::AspectSource::Raw)?, crate::model::FinalType::Reel))?;
-            let history = persist::load_history(&self.root, &fallback, &project_id, &version_id)?;
-            self.histories.insert((project_id, version_id), history);
+    /// Rewrite the version's feedback/feedback.json and, once there is a mark, approval.json.
+    fn write_feedback(&self, pi: usize, vi: usize) -> Result<(), Error> {
+        let (project_id, version_id) = self.ids(pi, vi);
+        let files = self.files(&project_id, &version_id);
+        let file = self.feedback_file(pi, vec![self.version_feedback(pi, vi)?]);
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|_| Error::invalid("could not write feedback"))?;
+        storage::atomic_write(&files.feedback(), &bytes)?;
+        let version = &self.projects[pi].versions[vi];
+        if let Some(approval) = &version.approval {
+            let bytes = serde_json::to_vec_pretty(&feedback::approval_json(&version.label, approval)).map_err(|_| Error::invalid("could not write approval"))?;
+            storage::atomic_write(&files.approval(), &bytes)?;
         }
         Ok(())
     }
@@ -573,164 +1045,46 @@ impl Portal {
         )
     }
 
-    fn require_admin(&self, role: &Role) -> Result<(), Error> {
-        if matches!(role, Role::Admin) { Ok(()) } else { Err(Error::forbidden("the dashboard is for the admin link")) }
-    }
-
     fn client_scope(&self, role: &Role) -> Result<String, Error> {
         match role {
             Role::Admin => Err(Error::invalid("choose a client link for uploads and new projects")),
-            Role::Client { client_id, .. } => Ok(client_id.clone()),
-            Role::Reviewer { client_id, .. } => Ok(client_id.clone()),
-            Role::Agent { project_id } => Ok(self.project(project_id)?.client_id.clone()),
-        }
-    }
-
-    fn project_scope<'a>(&'a self, role: &'a Role) -> Result<&'a str, Error> {
-        match role {
-            Role::Reviewer { project_id, .. } | Role::Agent { project_id } => Ok(project_id),
-            Role::Client { .. } | Role::Admin => Err(Error::invalid("open a reviewer or editor link for the timeline")),
-        }
-    }
-
-    fn actor(&self, role: &Role, project_id: &str) -> Result<Actor, Error> {
-        let project = self.project(project_id)?;
-        match role {
-            Role::Admin => Ok(Actor::Admin),
-            Role::Agent { .. } => Ok(Actor::Agent),
-            Role::Client { client_id, name } | Role::Reviewer { client_id, name, .. } => {
-                if &project.client_id != client_id && !matches!(role, Role::Admin) {
-                    return Err(Error::forbidden("that project belongs to another client"));
-                }
-                Ok(Actor::Client { client_id: client_id.clone(), name: name.clone() })
-            }
+            Role::Client { client_id, .. } | Role::Reviewer { client_id, .. } => Ok(client_id.clone()),
+            Role::Editor { project_id } | Role::Watcher { project_id } => Ok(self.project(project_id)?.client_id.clone()),
         }
     }
 
     fn project(&self, id: &str) -> Result<&ProjectRecord, Error> {
-        self.projects.iter().find(|project| project.id == id).ok_or_else(|| Error::not_found("no project"))
-    }
-
-    fn history(&self, project: &str, version: &str) -> Result<&History, Error> {
-        self.histories.get(&(project.to_string(), version.to_string())).ok_or_else(|| Error::not_found("no version"))
-    }
-
-    fn resolve_version(&self, project_id: &str, version_id: Option<&str>) -> Result<String, Error> {
-        let project = self.project(project_id)?;
-        if let Some(id) = version_id {
-            if project.versions.iter().any(|version| version.id == id) {
-                return Ok(id.to_string());
-            }
-            return Err(Error::not_found("no version"));
-        }
-        project.versions.first().map(|version| version.id.clone()).ok_or_else(|| Error::not_found("this project has no versions"))
-    }
-
-    fn version_difference(&self, project_id: &str, version_id: &str) -> Result<String, Error> {
-        self.project(project_id)?
-            .versions
-            .iter()
-            .find(|version| version.id == version_id)
-            .map(|version| version.difference.clone())
-            .ok_or_else(|| Error::not_found("no version"))
+        self.projects.iter().find(|p| p.id == id).ok_or_else(|| Error::not_found("no project"))
     }
 
     fn client_name(&self, client_id: &str) -> Option<String> {
-        self.clients.iter().find(|client| client.id == client_id).map(|client| client.name.clone())
+        self.clients.iter().find(|c| c.id == client_id).map(|c| c.name.clone())
     }
 
     fn known_broll(&self, client_id: &str) -> Vec<String> {
-        self.broll.iter().filter(|item| item.client_id == client_id).map(|item| item.id.clone()).collect()
-    }
-
-    fn owns_key(&self, client_id: &str, key: &str) -> Result<(), Error> {
-        let prefix = format!("c/{client_id}/");
-        if key.starts_with(&prefix) { Ok(()) } else { Err(Error::forbidden("that file belongs to another client")) }
+        self.broll.iter().filter(|b| b.client_id == client_id).map(|b| b.id.clone()).collect()
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct CompleteMeta {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub width: u32,
-    #[serde(default)]
-    pub height: u32,
-    #[serde(default)]
-    pub duration: crate::model::MediaTick,
+/// The client whose step on the chain last touched one of `targets`, when that step is a
+/// client's: an editor command changing it needs a reason (PR #5's overwrite rule).
+fn overwrites_client(events: &[ActionEvent], targets: &[String]) -> Option<String> {
+    let chain = effective_chain(events);
+    targets.iter().find(|t| chain.iter().rev().find(|e| e.targets.contains(t)).is_some_and(|e| e.actor.is_client())).cloned()
 }
 
-fn guard(role: &Role, status: Status, edit: &EditRequest) -> Result<(), Error> {
-    let reviewer = matches!(role, Role::Reviewer { .. } | Role::Client { .. });
-    if reviewer && status == Status::AgentWorking {
-        return Err(Error::locked("your editor is working — the timeline is read-only until it's marked ready"));
-    }
-    if reviewer && !ops::reviewer_may(edit) {
-        return Err(Error::forbidden("that control is not on the review timeline"));
-    }
-    if matches!(role, Role::Agent { .. }) && ops::is_approval(edit) {
-        return Err(Error::forbidden("approval is the client's mark"));
-    }
-    Ok(())
+fn no_watchers(role: &Role) -> Result<(), Error> {
+    if matches!(role, Role::Watcher { .. }) { Err(Error::forbidden("this link can watch but not comment")) } else { Ok(()) }
 }
 
-fn blank_like(snapshot: &Snapshot) -> Result<Snapshot, Error> {
-    let mut blank =
-        Snapshot::new(crate::model::Timeline::blank(snapshot.timeline.width, snapshot.timeline.height, snapshot.timeline.aspect_source)?, snapshot.final_type);
-    blank.timeline.fps_num = snapshot.timeline.fps_num;
-    blank.timeline.fps_den = snapshot.timeline.fps_den;
-    Ok(blank)
+fn version_cards(project: &ProjectRecord) -> Vec<VersionCard> {
+    project.versions.iter().map(|v| VersionCard { id: v.id.clone(), label: v.label.clone(), status: v.status }).collect()
+}
+
+fn owns_key(client_id: &str, key: &str) -> Result<(), Error> {
+    if key.starts_with(&format!("c/{client_id}/")) { Ok(()) } else { Err(Error::forbidden("that file belongs to another client")) }
 }
 
 fn stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-fn role_name(role: &Role) -> &'static str {
-    match role {
-        Role::Admin => "admin",
-        Role::Client { .. } => "client",
-        Role::Reviewer { .. } => "reviewer",
-        Role::Agent { .. } => "agent",
-    }
-}
-
-fn aspect_source_name(source: crate::model::AspectSource) -> &'static str {
-    match source {
-        crate::model::AspectSource::Raw => "raw",
-        crate::model::AspectSource::Profile => "profile",
-        crate::model::AspectSource::ChangeFormat => "change_format",
-    }
-}
-
-fn event_view(event: &crate::model::EditEvent, chain: &[u64]) -> present::EventView {
-    present::EventView {
-        id: event.id,
-        at: event.at.clone(),
-        actor: event.actor.label(),
-        action: event.action.clone(),
-        summary: event.summary.clone(),
-        reason: event.reason.clone(),
-        targets: event.targets.clone(),
-        in_effect: chain.contains(&event.id),
-    }
-}
-
-fn frame_notes(snapshot: &Snapshot, targets: &[String]) -> Vec<String> {
-    let mut notes = Vec::new();
-    for target in targets {
-        if let Some(clip) = snapshot.timeline.clips.iter().find(|clip| &clip.id == target) {
-            if let Ok(frames) = snapshot.timeline.tick_to_frame(clip.duration) {
-                notes.push(format!("{} {frames}f", clip.name));
-            }
-        } else if let Some(caption) = snapshot.timeline.captions.iter().find(|caption| &caption.id == target) {
-            notes.push(caption.text.clone());
-        }
-    }
-    notes
-}
-
-fn fs_ensure(root: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(root).map_err(|_| Error::invalid("could not create the data directory"))
 }

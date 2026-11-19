@@ -1,15 +1,15 @@
-//! Review-portal documents. Edit math uses [`MediaTick`], which is a
-//! [`reelsmith_time::Tick`] stored as a decimal string so a JSON number cannot round it.
+//! Review-portal records: who did what, versions' status and approval, comment threads and the
+//! B-roll library. The cut itself is the engine's `.fcproj`; nothing here models a timeline.
+//! Times use [`MediaTick`], a [`reelsmith_time::Tick`] stored as a decimal string so a JSON
+//! number cannot round it.
 
 use crate::error::Error;
-use reelsmith_time::{TICKS_PER_SECOND, Tick};
+use reelsmith_time::Tick;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const MAX_CLIPS: usize = 2_000;
-pub const MAX_CAPTIONS: usize = 2_000;
 pub const MAX_COMMENTS: usize = 2_000;
-pub const MAX_EVENTS: usize = 50_000;
+pub const MAX_ACTIONS: usize = 200_000;
 pub const MAX_TEXT: usize = 2_000;
 pub const MAX_NAME: usize = 120;
 
@@ -89,75 +89,66 @@ impl<'de> Deserialize<'de> for MediaTick {
     }
 }
 
-/// 0..=1000, a fraction of the frame width or height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Norm(pub u16);
-
-impl Norm {
-    pub fn new(value: u16) -> Result<Self, Error> {
-        if value > 1000 { Err(Error::invalid("a frame fraction must be between 0 and 1000")) } else { Ok(Self(value)) }
-    }
-}
-
-/// Linear gain in thousandths. 1000 is unity. The cap is 4.000.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Gain(pub u16);
-
-impl Gain {
-    pub const UNITY: Self = Self(1000);
-
-    pub fn new(value: u16) -> Result<Self, Error> {
-        if value > 4000 { Err(Error::invalid("gain must be between 0 and 4000 permille")) } else { Ok(Self(value)) }
-    }
-}
-
+/// A box on the picture in thousandths of the frame (0..=1000 on each axis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Region {
-    pub x: Norm,
-    pub y: Norm,
-    pub w: Norm,
-    pub h: Norm,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
 }
 
 impl Region {
     pub fn new(x: u16, y: u16, w: u16, h: u16) -> Result<Self, Error> {
-        if w == 0 || h == 0 {
+        Self { x, y, w, h }.checked()
+    }
+
+    pub fn checked(self) -> Result<Self, Error> {
+        if self.w == 0 || self.h == 0 {
             return Err(Error::invalid("a frame region needs a width and a height"));
         }
-        let x = Norm::new(x)?;
-        let y = Norm::new(y)?;
-        let w = Norm::new(w)?;
-        let h = Norm::new(h)?;
-        if u32::from(x.0) + u32::from(w.0) > 1000 || u32::from(y.0) + u32::from(h.0) > 1000 {
+        if self.x > 1000 || self.y > 1000 || self.w > 1000 || self.h > 1000 {
+            return Err(Error::invalid("a frame fraction must be between 0 and 1000"));
+        }
+        if u32::from(self.x) + u32::from(self.w) > 1000 || u32::from(self.y) + u32::from(self.h) > 1000 {
             return Err(Error::invalid("a frame region has to stay inside the picture"));
         }
-        Ok(Self { x, y, w, h })
+        Ok(self)
     }
+}
+
+/// Who did something, as the server knows it from the link token (never from the page).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    Client,
+    Agent,
+    Admin,
+    Watcher,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Actor {
-    Client { client_id: String, name: String },
-    Agent,
-    Admin,
+pub struct Actor {
+    pub kind: ActorKind,
+    pub id: String,
+    pub name: String,
 }
 
 impl Actor {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Client { name, .. } => name.clone(),
-            Self::Agent => "Agent".to_string(),
-            Self::Admin => "Admin".to_string(),
-        }
+    pub fn client(id: &str, name: &str) -> Self {
+        Self { kind: ActorKind::Client, id: id.to_string(), name: name.to_string() }
     }
 
-    pub fn is_agent(&self) -> bool {
-        matches!(self, Self::Agent)
+    pub fn agent() -> Self {
+        Self { kind: ActorKind::Agent, id: "agent".to_string(), name: "Editor".to_string() }
+    }
+
+    pub fn watcher() -> Self {
+        Self { kind: ActorKind::Watcher, id: "watcher".to_string(), name: "Watcher".to_string() }
     }
 
     pub fn is_client(&self) -> bool {
-        matches!(self, Self::Client { .. })
+        self.kind == ActorKind::Client
     }
 }
 
@@ -189,27 +180,6 @@ impl FinalType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ClipKind {
-    Video,
-    Audio,
-    Music,
-    Broll,
-    Title,
-    EndCard,
-}
-
-impl ClipKind {
-    pub fn is_picture(self) -> bool {
-        matches!(self, Self::Video | Self::Broll | Self::Title | Self::EndCard)
-    }
-
-    pub fn is_sound(self) -> bool {
-        matches!(self, Self::Audio | Self::Music)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum AspectSource {
     /// Majority of the raw footage, by duration.
     Raw,
@@ -219,9 +189,10 @@ pub enum AspectSource {
     ChangeFormat,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    #[default]
     Draft,
     AgentWorking,
     Ready,
@@ -230,6 +201,16 @@ pub enum Status {
 }
 
 impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::AgentWorking => "agent_working",
+            Self::Ready => "ready",
+            Self::ChangesRequested => "changes_requested",
+            Self::Approved => "approved",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Draft => "Draft",
@@ -266,49 +247,8 @@ pub struct Approval {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Clip {
-    pub id: String,
-    pub track: String,
-    pub name: String,
-    pub kind: ClipKind,
-    pub start: MediaTick,
-    pub duration: MediaTick,
-    pub source_in: MediaTick,
-    pub source_duration: MediaTick,
-    pub gain_permille: Gain,
-    pub muted: bool,
-    pub linked: Option<String>,
-    pub text: String,
-    pub source_width: u32,
-    pub source_height: u32,
-}
-
-impl Clip {
-    pub fn end(&self) -> MediaTick {
-        self.start.saturating_add(self.duration)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Caption {
-    pub id: String,
-    pub start: MediaTick,
-    pub duration: MediaTick,
-    pub text: String,
-    /// Thousandths down the frame. 0 is the top.
-    pub anchor_y: Norm,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Word {
-    pub start: MediaTick,
-    pub end: MediaTick,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
-    pub author: String,
+    pub author: Actor,
     pub at: String,
     pub body: String,
 }
@@ -316,9 +256,10 @@ pub struct Reply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     pub id: String,
-    pub author: String,
-    pub start: MediaTick,
-    pub end: MediaTick,
+    pub author: Actor,
+    pub at: String,
+    pub start_tick: MediaTick,
+    pub end_tick: MediaTick,
     pub region: Option<Region>,
     pub body: String,
     pub resolved: bool,
@@ -345,123 +286,6 @@ pub enum MediaRole {
     Broll,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Timeline {
-    pub fps_num: u32,
-    pub fps_den: u32,
-    pub width: u32,
-    pub height: u32,
-    pub aspect_source: AspectSource,
-    pub snap_words: bool,
-    pub reframed: bool,
-    pub next_seq: u64,
-    pub clips: Vec<Clip>,
-    pub captions: Vec<Caption>,
-    pub words: Vec<Word>,
-    pub library: Vec<LibraryItem>,
-}
-
-impl Timeline {
-    pub fn blank(width: u32, height: u32, source: AspectSource) -> Result<Self, Error> {
-        if width == 0 || height == 0 || width > 7680 || height > 7680 {
-            return Err(Error::invalid("picture size must be between 1 and 7680 on each side"));
-        }
-        let timeline = Self {
-            fps_num: 30,
-            fps_den: 1,
-            width,
-            height,
-            aspect_source: source,
-            snap_words: true,
-            reframed: source == AspectSource::ChangeFormat,
-            next_seq: 1,
-            clips: Vec::new(),
-            captions: Vec::new(),
-            words: Vec::new(),
-            library: Vec::new(),
-        };
-        timeline.frame_ticks()?;
-        Ok(timeline)
-    }
-
-    pub fn frame_ticks(&self) -> Result<i64, Error> {
-        if self.fps_num == 0 || self.fps_den == 0 {
-            return Err(Error::invalid("frame rate cannot be zero"));
-        }
-        let num = i64::from(self.fps_num);
-        let den = i64::from(self.fps_den);
-        let ticks = TICKS_PER_SECOND.checked_mul(den).ok_or_else(|| Error::invalid("frame rate overflow"))?;
-        if ticks % num != 0 {
-            return Err(Error::invalid("frame rate does not divide the time base"));
-        }
-        let frame = ticks / num;
-        if frame <= 0 {
-            return Err(Error::invalid("frame duration is empty"));
-        }
-        Ok(frame)
-    }
-
-    pub fn frame_to_tick(&self, frame: i64) -> Result<MediaTick, Error> {
-        let size = self.frame_ticks()?;
-        frame.checked_mul(size).map(MediaTick).ok_or_else(|| Error::invalid("frame overflow"))
-    }
-
-    pub fn tick_to_frame(&self, tick: MediaTick) -> Result<i64, Error> {
-        let size = self.frame_ticks()?;
-        Ok(tick.0 / size)
-    }
-
-    pub fn alloc_id(&mut self, prefix: &str) -> String {
-        let id = format!("{prefix}{}", self.next_seq);
-        self.next_seq = self.next_seq.saturating_add(1);
-        id
-    }
-
-    pub fn clip(&self, id: &str) -> Result<&Clip, Error> {
-        self.clips.iter().find(|clip| clip.id == id).ok_or_else(|| Error::not_found(format!("no clip {id}")))
-    }
-
-    pub fn clip_mut(&mut self, id: &str) -> Result<&mut Clip, Error> {
-        self.clips.iter_mut().find(|clip| clip.id == id).ok_or_else(|| Error::not_found(format!("no clip {id}")))
-    }
-
-    pub fn duration(&self) -> MediaTick {
-        self.clips.iter().map(Clip::end).max().unwrap_or(MediaTick::ZERO)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub timeline: Timeline,
-    pub comments: Vec<Comment>,
-    pub status: Status,
-    pub approval: Option<Approval>,
-    pub decisions: String,
-    pub final_type: FinalType,
-}
-
-impl Snapshot {
-    pub fn new(timeline: Timeline, final_type: FinalType) -> Self {
-        Self { timeline, comments: Vec::new(), status: Status::Draft, approval: None, decisions: String::new(), final_type }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EditEvent {
-    pub id: u64,
-    pub at: String,
-    pub actor: Actor,
-    pub action: String,
-    pub targets: Vec<String>,
-    pub summary: String,
-    pub reason: Option<String>,
-    /// The state this event was applied on top of. `None` is the base snapshot.
-    pub based_on: Option<u64>,
-    pub relates_to: Option<u64>,
-    pub before: Snapshot,
-    pub after: Snapshot,
-}
-
 pub fn clean_text(value: &str, limit: usize, label: &str) -> Result<String, Error> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -478,54 +302,4 @@ pub fn clean_text(value: &str, limit: usize, label: &str) -> Result<String, Erro
 
 pub fn clean_name(value: &str, label: &str) -> Result<String, Error> {
     clean_text(value, MAX_NAME, label)
-}
-
-/// Actions that change a clip, a caption, or the sequence itself.
-pub fn is_picture_edit(action: &str) -> bool {
-    matches!(
-        action,
-        action::TRIM
-            | action::RAZOR
-            | action::MOVE
-            | action::LIFT
-            | action::GAIN
-            | action::LENGTH
-            | action::CAPTION
-            | action::CAPTION_MOVE
-            | action::FORMAT
-            | action::ASSEMBLE
-            | action::PLACE_BROLL
-    )
-}
-
-pub mod action {
-    pub const TRIM: &str = "timeline.trim";
-    pub const RAZOR: &str = "timeline.razor";
-    pub const MOVE: &str = "timeline.move";
-    pub const LIFT: &str = "timeline.lift";
-    pub const GAIN: &str = "clip.gain";
-    pub const LENGTH: &str = "timeline.length";
-    pub const CAPTION: &str = "caption.edit";
-    pub const CAPTION_MOVE: &str = "caption.move";
-    pub const SNAP: &str = "portal.snap";
-    pub const FORMAT: &str = "portal.change_format";
-    pub const COMMENT: &str = "portal.comment";
-    pub const RESOLVE: &str = "portal.resolve_comment";
-    pub const REPLY: &str = "portal.reply";
-    pub const APPROVE: &str = "portal.approve";
-    pub const REQUEST: &str = "portal.request_changes";
-    pub const DECISIONS: &str = "portal.decisions";
-    pub const FINAL_TYPE: &str = "portal.final_type";
-    pub const STATUS: &str = "portal.status";
-    pub const UNDO: &str = "portal.undo";
-    pub const REDO: &str = "portal.redo";
-    pub const RESTORE: &str = "portal.restore";
-    pub const ASSEMBLE: &str = "portal.assemble";
-    pub const PLACE_BROLL: &str = "portal.place_broll";
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Edge {
-    In,
-    Out,
 }

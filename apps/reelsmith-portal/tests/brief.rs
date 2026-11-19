@@ -17,6 +17,7 @@ fn brief() -> UploadBrief {
         project_name: "Spring workshop".to_string(),
         final_type: FinalType::Reel,
         target: None,
+        end_card: None,
         version_count: 1,
         differences: vec![],
         use_broll: false,
