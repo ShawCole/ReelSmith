@@ -82,6 +82,7 @@ pub mod links;
 pub mod menus;
 pub mod native_dialogs;
 pub mod panels;
+pub mod review;
 pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod play_ahead;
@@ -260,6 +261,8 @@ pub struct ReelsmithApp {
     pub(crate) ime_drawn_editor: Option<panels::graphics::DrawnImeEditor>,
     /// Project document generation last seen by the UI (the engine bumps it on replacement).
     ime_document_epoch: u64,
+    /// Set when the editor was opened from a portal review link ([`review`]).
+    pub review: Option<review::ReviewState>,
     /// Active sequence last seen by the UI; `sequence.close` need not emit `OpenSequence`.
     ime_active_sequence: Option<reelsmith_project::ItemId>,
     /// Viewports the Program monitor's editor published in, released when the app exits.

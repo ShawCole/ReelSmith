@@ -159,6 +159,11 @@ pub fn install() -> Result<(), JsValue> {
         })
         .into_js_value(),
     )?;
+    // A portal review link reads and opens nothing itself: its project and media come from the
+    // portal, and raw media must not be readable from a reviewer's console.
+    if crate::portal::locked() {
+        return Ok(());
+    }
     set_fn(
         &obj,
         "readFile",

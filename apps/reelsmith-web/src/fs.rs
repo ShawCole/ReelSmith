@@ -99,6 +99,20 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
     })
 }
 
+/// Register a `Blob` at exactly `path` (a portal media manifest puts each file where the
+/// project expects it). An existing entry at that path is replaced.
+pub fn register_at(path: &str, blob: web_sys::Blob) {
+    let size = blob.size() as u64;
+    FS.with(|fs| {
+        let mut fs = fs.borrow_mut();
+        let id = fs.next_id;
+        fs.next_id += 1;
+        fs.blobs.insert(id, blob);
+        fs.entries.insert(path.to_string(), Entry::Blob { id, size });
+        fs.recount();
+    });
+}
+
 /// Put bytes at a path (no download).
 pub fn put(path: &str, data: Vec<u8>) {
     FS.with(|fs| fs.borrow_mut().entries.insert(path.to_string(), Entry::Mem(data.into())));

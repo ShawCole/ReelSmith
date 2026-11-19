@@ -49,6 +49,7 @@ pub mod project_tools;
 pub mod proxies;
 pub mod relink;
 pub mod remix;
+pub mod review;
 pub mod scene_detect;
 pub mod scopes;
 pub mod sequence_extras;
@@ -594,6 +595,24 @@ pub struct Session {
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
     /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
     pub media_scan: Option<media_watch::MediaScan>,
+    /// Asked before every top-level command; an `Err` refuses it ([`review`]). `None` = all allowed.
+    pub policy: Option<CommandPolicy>,
+    /// Top-level journaled commands that succeeded, for a host that records who did what
+    /// ([`review`]). `None` = not collected.
+    pub outbox: Option<Vec<ExecutedCommand>>,
+}
+
+/// Decides whether a top-level command may run in this session (a review link's role).
+pub type CommandPolicy = Arc<dyn Fn(&str, &Value) -> std::result::Result<(), String> + Send + Sync>;
+
+/// One top-level command that ran and was journaled: what a portal logs and replays.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExecutedCommand {
+    pub id: String,
+    pub params: Value,
+    pub label: String,
+    /// Whether the project changed (false for selection, playhead and other view steps).
+    pub project_changed: bool,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -689,6 +708,8 @@ impl Session {
             command_origin: None,
             media_stamps: Default::default(),
             media_scan: None,
+            policy: None,
+            outbox: None,
         }
     }
 
@@ -854,6 +875,14 @@ impl Session {
         if self.exec_depth == 0 && journal && self.trim_play.active() {
             self.settle_trim_playback(id);
         }
+        if self.exec_depth == 0
+            && let Some(policy) = &self.policy
+            && let Err(why) = policy(id, &params)
+        {
+            let e = EngineError::Disabled(id.to_string(), why);
+            self.log.push(panels::Level::Warning, id, e.to_string());
+            return Err(e);
+        }
         if let Err(why) = self.enabled_for(spec, &params) {
             let e = EngineError::Disabled(id.to_string(), why);
             if self.exec_depth == 0 {
@@ -873,6 +902,7 @@ impl Session {
         if outermost {
             self.command_origin = Some(id.to_string());
         }
+        let project_before = (outermost && journal && self.outbox.is_some()).then(|| self.project.clone());
         self.exec_depth += 1;
         // Last-resort guard: a panic in a command (a bug that escaped the never-crash rules)
         // becomes an error for the caller (UI, CLI, control channel, MCP) instead of taking the
@@ -907,6 +937,13 @@ impl Session {
         self.sync_persistence();
         // playback reads the newest snapshot (mixer moves, mutes… are heard while playing)
         self.previews.live.publish_project(self.project.clone());
+        if r.is_ok()
+            && let Some(before) = project_before
+            && let Some(outbox) = &mut self.outbox
+        {
+            let project_changed = !Arc::ptr_eq(&before, &self.project);
+            outbox.push(ExecutedCommand { id: id.to_string(), params: params.clone(), label: spec.label.to_string(), project_changed });
+        }
         if r.is_ok() && journal {
             self.journal.push((id.to_string(), params));
             if self.journal.len() > 10_000 {
@@ -1469,6 +1506,8 @@ mod mixer_tests;
 mod multicam_tests;
 #[cfg(test)]
 mod named_targets_tests;
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod narration_tests;
 #[cfg(test)]

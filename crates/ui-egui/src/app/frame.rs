@@ -61,7 +61,11 @@ impl ReelsmithApp {
         }
         let header_h = if self.ui.show_header { header::HEIGHT } else { 0.0 };
         let header = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), header_h));
-        if self.ui.show_header {
+        if self.review.as_ref().is_some_and(|r| r.locked()) {
+            // a review link has its own header (no menus, modes or workspaces) and stays in Edit
+            self.ui.mode = state::Mode::Edit;
+            crate::review::header(self, ui, header);
+        } else if self.ui.show_header {
             header::show(self, ui, header);
         }
         let status_h = if self.ui.show_status_bar { 20.0 } else { 0.0 };

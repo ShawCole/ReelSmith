@@ -1,0 +1,22 @@
+:root { color-scheme: light dark; --bg: #f7f7f5; --fg: #1c1c1c; --muted: #666; --card: #fff; --line: #ddd; --accent: #2457c5; --err: #b3261e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #eee; --muted: #9a9a9a; --card: #202020; --line: #333; --accent: #7aa2ff; --err: #ff8a80; } }
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+header { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+main { max-width: 860px; margin: 0 auto; padding: 16px; }
+h2 { font-size: 18px; margin: 24px 0 8px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 8px 0; }
+.note { color: var(--muted); }
+.error { color: var(--err); }
+.links a { margin-right: 12px; }
+.field { display: block; margin: 10px 0; }
+.field > span { display: block; font-weight: 600; margin-bottom: 4px; }
+input, select, button { font: inherit; }
+input[type=text], input[type=number], select { width: 100%; max-width: 360px; padding: 6px; }
+.row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.hidden { display: none; }
+.drop { border: 2px dashed var(--line); border-radius: 8px; padding: 18px; text-align: center; color: var(--muted); margin: 6px 0; }
+.drop.over { border-color: var(--accent); color: var(--fg); }
+button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+button:disabled { opacity: .6; }
+ul.files { margin: 4px 0; padding-left: 18px; }

@@ -26,6 +26,7 @@ pub mod host;
 pub mod hostmode;
 pub mod import;
 pub mod opfs;
+pub mod portal;
 pub mod recovery;
 pub mod recovery_policy;
 pub mod webcodecs;
@@ -65,6 +66,15 @@ pub fn repaint() {
 /// Give a host that builds its own [`WebApp`] the egui context that [`post`] and [`repaint`] wake.
 /// [`start`] calls it; an embedding app that runs `WebApp` in its own eframe runner calls it once
 /// from its app creator, or posted actions and JS API requests wait for the next input event.
+/// Ask for a frame within `ms` (the portal poll keeps running while nothing else repaints).
+pub fn repaint_after(ms: u64) {
+    CTX.with(|c| {
+        if let Some(c) = c.borrow().as_ref() {
+            c.request_repaint_after(std::time::Duration::from_millis(ms));
+        }
+    });
+}
+
 pub fn set_context(ctx: egui::Context) {
     CTX.with(|c| *c.borrow_mut() = Some(ctx));
 }
@@ -107,6 +117,8 @@ impl eframe::App for WebApp {
             f(self, ctx);
         }
         self.app.logic_inner(ctx);
+        // a portal link sends what this page did and picks up other people's changes
+        portal::tick(self);
         // exports advance between frames (no threads)
         if self.app.session.pump_jobs(std::time::Duration::from_millis(30)) {
             ctx.request_repaint();
@@ -146,8 +158,14 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
     // opts a page in instead: it runs ReelSmith in its own document and talks over DOM
     // `CustomEvent`s on the canvas. In host mode the host sends the document to edit, so no demo
     // project opens and nothing from an earlier visit is recovered.
-    let host = host::Bridge::connect(&canvas);
-    let in_host_mode = host.is_some();
+    // A portal review link (`/edit/`, `/review/`, `/watch/` + `#token`): the project comes from
+    // the portal, nothing is recovered or demoed, and the session is locked to the link's role.
+    let portal_link = match portal::token_from_location() {
+        Some(token) => Some(portal::boot(&token).await?),
+        None => None,
+    };
+    let host = if portal_link.is_some() { None } else { host::Bridge::connect(&canvas) };
+    let in_host_mode = host.is_some() || portal_link.is_some();
 
     let isolated = js_sys::Reflect::get(&js_sys::global(), &"crossOriginIsolated".into()).ok().and_then(|v| v.as_bool()).unwrap_or(false);
     // Frame rendering runs cooperatively on this thread. wasm threads need a cross-origin
@@ -216,6 +234,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                     let _ = session.execute("file.openDemoProject", json!({}));
                 }
                 let mut app = ReelsmithApp::new(session);
+                if let Some((boot, bytes)) = portal_link {
+                    portal::open(&mut app, &boot, bytes);
+                }
                 import::install_hooks(&mut app);
                 // Settings ▸ General ▸ Interface Language ▸ System Language (#218): the browser's languages.
                 app.hooks.system_languages =

@@ -22,7 +22,8 @@
 <p align="center">
   <a href="https://github.com/ShawCole/ReelSmith">Source</a> ·
   <a href="https://github.com/ShawCole/ReelSmith/issues">Issues</a> ·
-  <a href="docs/style-pipeline/SPEC.md">Style pipeline</a>
+  <a href="docs/style-pipeline/SPEC.md">Style pipeline</a> ·
+  <a href="docs/portal/DESIGN.md">Review portal</a>
 </p>
 
 <p align="center">
@@ -384,7 +385,7 @@ emerge --ask media-video/reelsmith-bin
 
 ReelSmith is a modified version of [FilmCraft](https://github.com/storytold/filmcraft), an open-source non-linear video editor. This tree keeps FilmCraft's Apache-2.0 and MIT license texts and the copyright notices in source files. See [NOTICE](NOTICE).
 
-The style pipeline (learn an editing style from finished work, suggest changes, apply it to raw footage) is specified in [docs/style-pipeline/SPEC.md](docs/style-pipeline/SPEC.md). The ad-edit runbook is [docs/style-pipeline/AD_RUNBOOK.md](docs/style-pipeline/AD_RUNBOOK.md).
+The style pipeline (learn an editing style from finished work, suggest changes, apply it to raw footage) is specified in [docs/style-pipeline/SPEC.md](docs/style-pipeline/SPEC.md). The ad-edit runbook is [docs/style-pipeline/AD_RUNBOOK.md](docs/style-pipeline/AD_RUNBOOK.md). The review portal, where clients upload footage, review and edit the cut in the ReelSmith editor itself, and mark it good or not good, is described in [docs/portal/DESIGN.md](docs/portal/DESIGN.md).
 
 ## License and credits
 

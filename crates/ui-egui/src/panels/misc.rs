@@ -135,12 +135,13 @@ pub fn history(app: &mut ReelsmithApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if let Some(n) = target {
         if n < 0 {
+            // through the command bus, so a portal link logs (and may refuse) each step
             for _ in 0..-n {
-                app.session.undo();
+                let _ = app.session.execute("edit.undo", serde_json::json!({}));
             }
         } else {
             for _ in 0..n {
-                app.session.redo();
+                let _ = app.session.execute("edit.redo", serde_json::json!({}));
             }
         }
     }

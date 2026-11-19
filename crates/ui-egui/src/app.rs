@@ -59,6 +59,7 @@ impl ReelsmithApp {
             ime_composer_target: None,
             ime_drawn_editor: None,
             ime_document_epoch,
+            review: None,
             ime_active_sequence,
             ime_viewports: Vec::new(),
             textures: HashMap::new(),

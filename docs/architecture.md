@@ -22,7 +22,7 @@ Design principles:
 ## 1. Layers
 
 ```text
- L6  apps/reelsmith · apps/reelsmith-cli · apps/reelsmith-web
+ L6  apps/reelsmith · apps/reelsmith-cli · apps/reelsmith-web · apps/reelsmith-portal
  L5  ui-egui · automation · platform
  L4  engine
  L3  render · gpu · export · golden (test-only)

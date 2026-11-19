@@ -525,6 +525,7 @@ pub fn handle(app: &mut ReelsmithApp, ctx: &egui::Context, req: &ControlRequest)
             let prefix = s("prefix").unwrap_or("");
             ok(serde_json::to_value(app.auto.query(prefix)).unwrap_or_default())
         }
+        "ui.set" if app.review.as_ref().is_some_and(|r| r.locked()) => err("not available on a review link"),
         "ui.set" => handle_ui_set(app, ctx, p),
         "ui.panel.show" | "ui.panel.close" => {
             let Some(panel) = s("panel").and_then(PanelKind::from_name) else { return err("unknown `panel`") };
