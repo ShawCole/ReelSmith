@@ -5,7 +5,7 @@
 //! B-roll never shares a file with the raw A-roll.
 
 use crate::error::Error;
-use crate::model::{AspectSource, FinalType, MAX_NAME, Mark, MediaTick, Snapshot, clean_name};
+use crate::model::{AspectSource, FinalType, MAX_NAME, MediaTick, clean_name};
 use reelsmith_time::TICKS_PER_SECOND;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,9 @@ pub struct UploadBrief {
     pub final_type: FinalType,
     #[serde(default)]
     pub target: Option<LengthTarget>,
+    /// End card toggle. Omitted means the final type's default (an ad has one).
+    #[serde(default)]
+    pub end_card: Option<bool>,
     /// Omitted means 1.
     #[serde(default = "one")]
     pub version_count: u32,
@@ -277,7 +280,7 @@ pub fn validate_brief(brief: &UploadBrief, known_broll: &[String]) -> Result<Bri
         target,
         versions,
         aspect,
-        defaults: type_defaults(brief.final_type),
+        defaults: TypeDefaults { end_card: brief.end_card.unwrap_or(type_defaults(brief.final_type).end_card), ..type_defaults(brief.final_type) },
         broll,
         raw_files: brief.raw_files.clone(),
         broll_uploads: brief.broll_uploads.clone(),
@@ -460,125 +463,4 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
         b = next;
     }
     a.max(1)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QcFlag {
-    pub level: String,
-    pub message: String,
-}
-
-pub fn qc_flags(plan: &BriefPlan, snapshot: &Snapshot) -> Vec<QcFlag> {
-    let mut flags = Vec::new();
-    let duration = snapshot.timeline.duration();
-    match &plan.target {
-        LengthTarget::Unspecified => {}
-        LengthTarget::Exact { ticks } => {
-            if duration.0 > ticks.0 {
-                flags.push(QcFlag { level: "warn".to_string(), message: "the cut is longer than the target".to_string() });
-            } else if duration.0 < ticks.0 {
-                flags.push(QcFlag { level: "warn".to_string(), message: "the cut is shorter than the target".to_string() });
-            }
-        }
-        LengthTarget::Range { min, max } => {
-            if duration.0 < min.0 || duration.0 > max.0 {
-                flags.push(QcFlag { level: "warn".to_string(), message: "the cut is outside the target length".to_string() });
-            }
-        }
-    }
-    let defaults = type_defaults(snapshot.final_type);
-    let captions_on = snapshot.timeline.captions.iter().any(|caption| !caption.text.trim().is_empty());
-    match defaults.captions {
-        CaptionDefault::On if !captions_on => {
-            flags.push(QcFlag { level: "warn".to_string(), message: "this format defaults to captions, and the timeline has none".to_string() });
-        }
-        CaptionDefault::Off if captions_on => {
-            flags.push(QcFlag { level: "note".to_string(), message: "captions are on, and this format leaves them optional".to_string() });
-        }
-        _ => {}
-    }
-    let has_end = snapshot.timeline.clips.iter().any(|clip| clip.kind == crate::model::ClipKind::EndCard);
-    if defaults.end_card && !has_end {
-        flags.push(QcFlag { level: "note".to_string(), message: "an ad defaults to an end card and a CTA; none is on the timeline yet".to_string() });
-    }
-    if !defaults.end_card && has_end {
-        flags.push(QcFlag { level: "note".to_string(), message: "an end card is on the timeline; this format leaves it off unless you add one".to_string() });
-    }
-    let output = AspectRatio::reduced(snapshot.timeline.width, snapshot.timeline.height).ok();
-    if let Some(output) = output {
-        for clip in &snapshot.timeline.clips {
-            if !clip.kind.is_picture() || clip.source_width == 0 || clip.source_height == 0 {
-                continue;
-            }
-            if let Ok(ratio) = AspectRatio::reduced(clip.source_width, clip.source_height)
-                && ratio != output
-            {
-                flags.push(QcFlag { level: "warn".to_string(), message: format!("{} is {} and the sequence is {}", clip.name, ratio.label(), output.label()) });
-            }
-        }
-    }
-    flags
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FeedbackFile {
-    pub schema: String,
-    pub client: String,
-    pub project: String,
-    pub final_type: FinalType,
-    pub versions: Vec<VersionFeedback>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VersionFeedback {
-    /// The shape `feedback.py --marks` already expects, one object per version.
-    pub approval: Option<ApprovalJson>,
-    pub difference: String,
-    pub comments: Vec<CommentExport>,
-    pub client_edits: Vec<EditExport>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ApprovalJson {
-    pub version: String,
-    pub mark: String,
-    pub note: String,
-    pub by: String,
-    pub at: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommentExport {
-    pub body: String,
-    pub start_ticks: String,
-    pub end_ticks: String,
-    pub region: Option<crate::model::Region>,
-    pub resolved: bool,
-    pub fixed_in: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EditExport {
-    pub action: String,
-    pub targets: Vec<String>,
-    pub summary: String,
-    pub at: String,
-    /// Clip or caption lengths before the edit, as frame counts. These are the style signal.
-    pub before_frames: Vec<String>,
-    pub after_frames: Vec<String>,
-}
-
-pub fn approval_json(difference: &str, snapshot: &Snapshot) -> Option<ApprovalJson> {
-    let approval = snapshot.approval.as_ref()?;
-    Some(ApprovalJson {
-        version: difference.to_string(),
-        mark: approval.mark.as_str().to_string(),
-        note: approval.note.clone(),
-        by: approval.by.clone(),
-        at: approval.at.clone(),
-    })
-}
-
-pub fn mark_name(mark: Mark) -> &'static str {
-    mark.as_str()
 }

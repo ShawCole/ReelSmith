@@ -1,265 +1,202 @@
-//! Append-only edit log.
+//! The action log of one version: `actions.jsonl`, one [`ActionEvent`] per line.
 //!
-//! Events are never removed. `state_of` is a cursor: `None` means the base snapshot, and
-//! `Some(id)` means that event's `after` snapshot. Undo, redo and restore append a record and
-//! move the cursor. An agent edit that changes something a client last touched on the current
-//! chain needs a reason, so a client trim is never replaced silently.
+//! Every step anyone takes on a version is an engine command `(id, params)` that the server
+//! replayed on its own session, or a portal action (`portal.comment`, `portal.mark`, …) that is
+//! recorded but never replayed. The file is only ever appended to: [`write_log`] refuses to
+//! write fewer lines than the file holds. `seq` is the server's revision of the version.
+//!
+//! Undo and redo are steps too. Each carries `reverts_seq`, the project-changing step it takes
+//! back or re-applies, so the history panel and the feedback export know which steps are in
+//! effect ([`effective_chain`]) without replaying an undo blindly.
 
 use crate::error::Error;
-use crate::model::{Actor, EditEvent, MAX_EVENTS, MediaTick, Snapshot, is_picture_edit};
+use crate::model::{Actor, MAX_ACTIONS};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct History {
-    pub base: Snapshot,
-    pub events: Vec<EditEvent>,
-    pub state_of: Option<u64>,
-    pub redo_of: Option<u64>,
-}
+pub const UNDO: &str = "edit.undo";
+pub const REDO: &str = "edit.redo";
 
-#[derive(Clone, Debug)]
-pub struct Commit {
-    pub actor: Actor,
+/// One line of `actions.jsonl` (API.md "ActionEvent").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionEvent {
+    pub seq: u64,
+    /// Server time, RFC 3339 UTC.
     pub at: String,
-    pub action: String,
-    pub targets: Vec<String>,
-    pub summary: String,
+    /// From the link token, never from the page.
+    pub actor: Actor,
+    /// `editor`, `reviewer` or `watcher`: the role the step ran under.
+    pub role: String,
+    /// The engine command id, or `portal.*` for a portal action.
+    pub id: String,
+    pub params: Value,
+    pub label: String,
+    /// Whether the step changed the project (false for selection and playhead steps), as the
+    /// server's own replay saw it.
+    pub project_changed: bool,
+    pub based_on_seq: u64,
     pub reason: Option<String>,
-    pub after: Snapshot,
-    pub relates_to: Option<u64>,
+    pub client_ts: Option<String>,
+    /// For `edit.undo` / `edit.redo`: the step it takes back or re-applies.
+    pub reverts_seq: Option<u64>,
+    /// Clip, track, caption and marker ids named in `params` (PLAN §3).
+    #[serde(default)]
+    pub targets: Vec<String>,
 }
 
-impl History {
-    pub fn new(base: Snapshot) -> Self {
-        Self { base, events: Vec::new(), state_of: None, redo_of: None }
+impl ActionEvent {
+    /// Portal actions are logged for the history panel and never replayed on the engine.
+    pub fn is_portal(&self) -> bool {
+        self.id.starts_with("portal.")
     }
+}
 
-    pub fn current(&self) -> Result<Snapshot, Error> {
-        self.snapshot_of(self.state_of)
+/// Read a version's log. A missing file is an empty log.
+pub fn read_log(path: &Path) -> Result<Vec<ActionEvent>, Error> {
+    if !path.exists() {
+        return Ok(Vec::new());
     }
-
-    pub fn can_undo(&self) -> bool {
-        self.state_of.is_some()
+    let file = fs::File::open(path).map_err(|_| Error::invalid("could not read the action log"))?;
+    let mut events = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|_| Error::invalid("could not read the action log"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: ActionEvent = serde_json::from_str(&line).map_err(|_| Error::invalid(format!("action log line {} is unreadable", index + 1)))?;
+        events.push(event);
     }
+    Ok(events)
+}
 
-    pub fn can_redo(&self) -> bool {
-        self.redo_of.is_some()
+/// Make the file hold `events`: append the ones it does not have yet. Refuses (409) when the
+/// file already holds more steps than `events`, so the log can never be shortened, and when
+/// the steps would not be numbered 1, 2, 3, ….
+pub fn write_log(path: &Path, events: &[ActionEvent]) -> Result<(), Error> {
+    if events.len() > MAX_ACTIONS {
+        return Err(Error::invalid("this version's history is full"));
     }
-
-    pub fn event(&self, id: u64) -> Result<&EditEvent, Error> {
-        self.events.iter().find(|event| event.id == id).ok_or_else(|| Error::not_found(format!("no event {id}")))
+    if events.iter().enumerate().any(|(i, e)| e.seq != i as u64 + 1) {
+        return Err(Error::invalid("action log steps must be numbered from 1 without gaps"));
     }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = if path.exists() { count_lines(path)? } else { 0 };
+    if existing > events.len() {
+        return Err(Error::conflict("refusing to shorten the action log"));
+    }
+    if existing < events.len() {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        for event in events.iter().skip(existing) {
+            let line = serde_json::to_string(event).map_err(|_| Error::invalid("could not record the step"))?;
+            writeln!(file, "{line}")?;
+        }
+        file.sync_all()?;
+    }
+    Ok(())
+}
 
-    pub fn snapshot_of(&self, id: Option<u64>) -> Result<Snapshot, Error> {
-        match id {
-            None => Ok(self.base.clone()),
-            Some(id) => Ok(self.event(id)?.after.clone()),
+fn count_lines(path: &Path) -> Result<usize, Error> {
+    let file = fs::File::open(path).map_err(|_| Error::invalid("could not read the action log"))?;
+    let mut count = 0usize;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|_| Error::invalid("could not read the action log"))?;
+        if !line.trim().is_empty() {
+            count = count.saturating_add(1);
         }
     }
+    Ok(count)
+}
 
-    pub fn commit(&mut self, commit: Commit) -> Result<&EditEvent, Error> {
-        if self.events.len() >= MAX_EVENTS {
-            return Err(Error::invalid("this version's history is full"));
+/// The engine's undo stacks as seen through the log: `done` holds the project-changing steps
+/// in effect (oldest first), `undone` the ones an undo took back (most recent last).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Stacks {
+    pub done: Vec<u64>,
+    pub undone: Vec<u64>,
+}
+
+impl Stacks {
+    pub fn of(events: &[ActionEvent]) -> Self {
+        let mut stacks = Self::default();
+        for event in events {
+            stacks.push(event);
         }
-        self.ensure_agent_reason(&commit.actor, &commit.reason, &commit.after, is_picture_edit(&commit.action))?;
-        let before = self.current()?;
-        let id = self.next_id();
-        let event = EditEvent {
-            id,
-            at: commit.at,
-            actor: commit.actor,
-            action: commit.action,
-            targets: commit.targets,
-            summary: commit.summary,
-            reason: nonempty(commit.reason),
-            based_on: self.state_of,
-            relates_to: commit.relates_to,
-            before,
-            after: commit.after,
-        };
-        self.events.push(event);
-        self.state_of = Some(id);
-        self.redo_of = None;
-        self.events.last().ok_or_else(|| Error::invalid("history append failed"))
+        stacks
     }
 
-    pub fn undo(&mut self, actor: Actor, at: String, reason: Option<String>) -> Result<&EditEvent, Error> {
-        let current_id = self.state_of.ok_or_else(|| Error::invalid("nothing to undo"))?;
-        let previous = self.event(current_id)?.based_on;
-        let after = self.snapshot_of(previous)?;
-        self.ensure_agent_reason(&actor, &reason, &after, true)?;
-        if self.events.len() >= MAX_EVENTS {
-            return Err(Error::invalid("this version's history is full"));
+    /// Account for one more step.
+    pub fn push(&mut self, event: &ActionEvent) {
+        if event.is_portal() || !event.project_changed {
+            return;
         }
-        let before = self.current()?;
-        let summary = format!("Undid step {current_id}");
-        let id = self.next_id();
-        self.events.push(EditEvent {
-            id,
-            at,
-            actor,
-            action: crate::model::action::UNDO.to_string(),
-            targets: vec![current_id.to_string()],
-            summary,
-            reason: nonempty(reason),
-            based_on: self.state_of,
-            relates_to: Some(current_id),
-            before,
-            after,
-        });
-        self.redo_of = Some(current_id);
-        self.state_of = previous;
-        self.events.last().ok_or_else(|| Error::invalid("history append failed"))
-    }
-
-    pub fn redo(&mut self, actor: Actor, at: String) -> Result<&EditEvent, Error> {
-        let target = self.redo_of.ok_or_else(|| Error::invalid("nothing to redo"))?;
-        let after = self.snapshot_of(Some(target))?;
-        if self.events.len() >= MAX_EVENTS {
-            return Err(Error::invalid("this version's history is full"));
-        }
-        let before = self.current()?;
-        let id = self.next_id();
-        self.events.push(EditEvent {
-            id,
-            at,
-            actor,
-            action: crate::model::action::REDO.to_string(),
-            targets: vec![target.to_string()],
-            summary: format!("Redid step {target}"),
-            reason: None,
-            based_on: self.state_of,
-            relates_to: Some(target),
-            before,
-            after,
-        });
-        self.state_of = Some(target);
-        self.redo_of = None;
-        self.events.last().ok_or_else(|| Error::invalid("history append failed"))
-    }
-
-    /// Restore the snapshot as of `event_id`. `None` restores the base. The restored steps stay
-    /// in the log, and this restore is itself a step that can be undone.
-    pub fn restore(&mut self, actor: Actor, at: String, event_id: Option<u64>, reason: Option<String>) -> Result<&EditEvent, Error> {
-        if let Some(id) = event_id {
-            let _ = self.event(id)?;
-        }
-        let after = self.snapshot_of(event_id)?;
-        self.ensure_agent_reason(&actor, &reason, &after, true)?;
-        if self.events.len() >= MAX_EVENTS {
-            return Err(Error::invalid("this version's history is full"));
-        }
-        let before = self.current()?;
-        let label = event_id.map(|id| id.to_string()).unwrap_or_else(|| "the original assembly".to_string());
-        let id = self.next_id();
-        self.events.push(EditEvent {
-            id,
-            at,
-            actor,
-            action: crate::model::action::RESTORE.to_string(),
-            targets: vec![label.clone()],
-            summary: format!("Restored {label}"),
-            reason: nonempty(reason),
-            based_on: self.state_of,
-            relates_to: event_id,
-            before,
-            after,
-        });
-        self.state_of = Some(id);
-        self.redo_of = None;
-        self.events.last().ok_or_else(|| Error::invalid("history append failed"))
-    }
-
-    /// Events in effect, oldest first. A restore jumps to the step it restored, so an undone
-    /// branch stays in `events` without counting as the current chain. Cycles are cut off.
-    pub fn chain(&self) -> Vec<&EditEvent> {
-        let mut cursor = self.state_of;
-        let mut out = Vec::new();
-        let mut seen = Vec::new();
-        while let Some(id) = cursor {
-            if seen.contains(&id) || seen.len() >= MAX_EVENTS {
-                break;
+        match (event.id.as_str(), event.reverts_seq) {
+            (UNDO, Some(seq)) => {
+                self.done.retain(|s| *s != seq);
+                self.undone.push(seq);
             }
-            seen.push(id);
-            let Some(event) = self.events.iter().find(|event| event.id == id) else { break };
-            let next = if event.action == crate::model::action::RESTORE { event.relates_to } else { event.based_on };
-            out.push(event);
-            cursor = next;
+            (REDO, Some(seq)) => {
+                self.undone.retain(|s| *s != seq);
+                self.done.push(seq);
+            }
+            (UNDO | REDO, None) => {}
+            _ => {
+                self.done.push(event.seq);
+                self.undone.clear();
+            }
         }
-        out.reverse();
-        out
     }
 
-    fn next_id(&self) -> u64 {
-        self.events.iter().map(|event| event.id).max().unwrap_or(0).saturating_add(1)
-    }
-
-    fn ensure_agent_reason(&self, actor: &Actor, reason: &Option<String>, after: &Snapshot, check: bool) -> Result<(), Error> {
-        if !check || !actor.is_agent() {
-            return Ok(());
+    /// What an `edit.undo` / `edit.redo` that changed the project reverts.
+    pub fn reverts(&self, id: &str) -> Option<u64> {
+        match id {
+            UNDO => self.done.last().copied(),
+            REDO => self.undone.last().copied(),
+            _ => None,
         }
-        let before = self.current()?;
-        let changed = changed_targets(&before, after);
-        let needs_reason = changed.iter().any(|target| self.last_touch(target).is_some_and(|event| event.actor.is_client()));
-        if needs_reason && nonempty(reason.clone()).is_none() {
-            return Err(Error::invalid("the agent needs a reason before it changes a client's edit — nothing was overwritten"));
-        }
-        Ok(())
-    }
-
-    fn last_touch(&self, target: &str) -> Option<&EditEvent> {
-        self.chain().into_iter().rev().find(|event| is_picture_edit(&event.action) && event.targets.iter().any(|item| item == target))
     }
 }
 
-fn nonempty(reason: Option<String>) -> Option<String> {
-    reason.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
-    })
+/// The project-changing steps in effect now, oldest first.
+pub fn effective_chain(events: &[ActionEvent]) -> Vec<&ActionEvent> {
+    let stacks = Stacks::of(events);
+    stacks.done.iter().filter_map(|seq| events.iter().find(|e| e.seq == *seq)).collect()
 }
 
-pub fn changed_targets(before: &Snapshot, after: &Snapshot) -> Vec<String> {
-    let mut ids = Vec::new();
-    for clip in &before.timeline.clips {
-        match after.timeline.clips.iter().find(|other| other.id == clip.id) {
-            Some(other) if other != clip => ids.push(clip.id.clone()),
-            None => ids.push(clip.id.clone()),
-            Some(_) => {}
-        }
-    }
-    for clip in &after.timeline.clips {
-        if before.timeline.clips.iter().all(|other| other.id != clip.id) {
-            ids.push(clip.id.clone());
-        }
-    }
-    for caption in &before.timeline.captions {
-        match after.timeline.captions.iter().find(|other| other.id == caption.id) {
-            Some(other) if other != caption => ids.push(caption.id.clone()),
-            None => ids.push(caption.id.clone()),
-            Some(_) => {}
-        }
-    }
-    for caption in &after.timeline.captions {
-        if before.timeline.captions.iter().all(|other| other.id != caption.id) {
-            ids.push(caption.id.clone());
-        }
-    }
-    if before.timeline.width != after.timeline.width
-        || before.timeline.height != after.timeline.height
-        || before.timeline.aspect_source != after.timeline.aspect_source
-    {
-        ids.push("sequence".to_string());
-    }
-    ids.sort();
-    ids.dedup();
-    ids
+/// The clients' project-changing steps in effect now: the style evidence (PLAN §7).
+pub fn client_actions(events: &[ActionEvent]) -> Vec<&ActionEvent> {
+    effective_chain(events).into_iter().filter(|e| e.actor.is_client()).collect()
 }
 
-pub fn client_edits(history: &History) -> Vec<&EditEvent> {
-    history.chain().into_iter().filter(|event| event.actor.is_client() && is_picture_edit(&event.action)).collect()
-}
-
-/// Duration of the current cut, used by length checks. Not a calendar conversion.
-pub fn current_duration(history: &History) -> Result<MediaTick, Error> {
-    Ok(history.current()?.timeline.duration())
+/// Ids a command's parameters name (clips, tracks, captions, markers), as strings.
+pub fn targets_of(params: &Value) -> Vec<String> {
+    const KEYS: &[&str] = &["clip", "clips", "item", "items", "track", "tracks", "caption", "captions", "marker", "markers"];
+    let mut out = Vec::new();
+    let Some(map) = params.as_object() else {
+        return out;
+    };
+    for key in KEYS {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        let values: Vec<&Value> = match value {
+            Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        for v in values {
+            let id = match v {
+                Value::Number(n) => n.to_string(),
+                Value::String(s) => s.clone(),
+                _ => continue,
+            };
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
 }
