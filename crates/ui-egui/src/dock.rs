@@ -41,10 +41,14 @@ pub enum PanelKind {
     ReferenceMonitor,
     Timecode,
     ProjectNotes,
+    /// Review links: comment threads on the version.
+    Comments,
+    /// Review links: who changed what, and when.
+    EditHistory,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 28] = [
+    pub const ALL: [PanelKind; 30] = [
         PanelKind::Project,
         PanelKind::MediaBrowser,
         PanelKind::Libraries,
@@ -73,6 +77,8 @@ impl PanelKind {
         PanelKind::ReferenceMonitor,
         PanelKind::Timecode,
         PanelKind::ProjectNotes,
+        PanelKind::Comments,
+        PanelKind::EditHistory,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -104,6 +110,8 @@ impl PanelKind {
             PanelKind::ReferenceMonitor => "Reference Monitor",
             PanelKind::Timecode => "Timecode",
             PanelKind::ProjectNotes => "Project Notes",
+            PanelKind::Comments => "Comments",
+            PanelKind::EditHistory => "Edit History",
         }
     }
     pub fn id(self) -> String {
@@ -515,6 +523,27 @@ fn workspace_root(name: &str) -> Node<PanelKind> {
                 hsplit(Ratio(0.6), tabs(&[Program], 0), tabs(&[LumetriColor, EssentialGraphics, EssentialSound, TextToSpeech, Properties, AudioTrackMixer], 0)),
             ),
             hsplit(Ratio(0.26), tabs(&[Project, MediaBrowser, Libraries, Info, Effects, Markers, History], 0), bottom_editing()),
+        ),
+        // Portal review link (crate::review): Program beside the review panels, Tools and the
+        // Timeline below. Not in WORKSPACES: a review link can't switch workspace.
+        "Client Review" => vsplit(
+            Ratio(0.6),
+            hsplit(Ratio(0.7), tabs(&[Program], 0), tabs(&[Comments, EditHistory], 0)),
+            hsplit(
+                SplitSize::FixedFirst(TOOLS_WIDTH),
+                tabs(&[Tools], 0),
+                hsplit(SplitSize::FixedSecond(METERS_WIDTH), tabs(&[Timeline], 0), tabs(&[AudioMeters], 0)),
+            ),
+        ),
+        // The editor on a portal link: the default layout with the review panels beside Properties.
+        "Portal Editor" => vsplit(
+            Ratio(0.57),
+            hsplit(
+                Ratio(0.72),
+                hsplit(Ratio(0.5), tabs(&[Source, EffectControls, AudioClipMixer, Metadata], 0), tabs(&[Program], 0)),
+                tabs(&[Comments, EditHistory, Properties, EssentialGraphics, Text], 0),
+            ),
+            hsplit(Ratio(0.29), tabs(&[Project, MediaBrowser, Libraries, Info, Effects, Markers, History], 0), bottom_editing()),
         ),
         // Editing (default), Learning, Review — Premiere 26 factory layout:
         // top: Source group | Program | Properties; bottom: Project group | Tools | Timeline | Meters.

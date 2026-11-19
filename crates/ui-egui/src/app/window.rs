@@ -74,6 +74,10 @@ impl ReelsmithApp {
     }
 
     pub fn show_panel(&mut self, p: PanelKind) {
+        if !self.review_allows_panel(p) {
+            self.ui.status = "That panel is not part of a review link".to_string();
+            return;
+        }
         // closed while floating: it floats again where it was (#1985); taken before the Timeline's
         // own restore below docks it
         let open = self.ui.dock.contains(&p);

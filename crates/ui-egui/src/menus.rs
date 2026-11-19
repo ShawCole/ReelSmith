@@ -205,6 +205,9 @@ pub(crate) fn menu_items_with_focus(app: &ReelsmithApp, ctx: &egui::Context) -> 
 
 /// Execute a UI or engine command by id.
 pub fn invoke_command(app: &mut ReelsmithApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    if !app.review_allows_ui_command(id) {
+        return Err(format!("`{id}` is not available on a review link"));
+    }
     // Select All / Deselect All act on the Project panel's items when it has focus (#168), only
     // what the shown bin lists (#456). Here and not in the key handling: on macOS the native menu
     // takes Cmd+A once Select All is enabled (a sequence is open) and sends the id here (#1752).
