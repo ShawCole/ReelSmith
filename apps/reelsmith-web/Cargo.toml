@@ -30,6 +30,7 @@ reelsmith-format = { workspace = true }
 reelsmith-time = { workspace = true }
 egui = { workspace = true }
 eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 wasm-bindgen = "=0.2.129"
